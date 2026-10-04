@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>PGG</title>
+  <rect width="512" height="512" rx="112" fill="#000"/>
+  <circle cx="256" cy="256" r="150" fill="#f02849"/>
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#fff" stroke-width="22" stroke-dasharray="46 46" stroke-linecap="butt"/>
+  <circle cx="256" cy="256" r="104" fill="#000"/>
+  <path d="M256 176c-24 36-64 58-64 92a34 34 0 0 0 58 24v38h-24v18h60v-18h-24v-38a34 34 0 0 0 58-24c0-34-40-56-64-92z" fill="#fff"/>
+</svg>

@@ -99,6 +99,36 @@ reproducible nor committable, so `@pgg/engine` replaces the deck's `shuffle` wit
 - **Lobby.** Only players who are not seated receive lobby broadcasts. (Pushing the full table list to
   seated players multiplied p99 latency by ~10 at 1,800 connections.)
 
+## Web client (`apps/web`)
+
+- **Mobile only.** Touch devices up to 900px get the app; everything else gets a QR code. Portrait is
+  enforced with a rotate notice. Safe-area insets and `dvh` units are used throughout.
+- **Light.** The initial download is **~118 KB gzip** (JS + CSS + HTML), checked against a 160 KB
+  budget by `bun run size`. React and `motion` (the `m` component with `LazyMotion`) are the only
+  runtime libraries; the QR generator and the fairness verifier are separate chunks loaded on demand.
+  No web3 stack is in the bundle yet; Milestone 2 loads it lazily on the cashier screens.
+- **A pure core.** Server messages go through one pure reducer (`lib/game.js`); a reconnecting socket
+  (`lib/socket.js`) measures RTT and clock skew so the turn timer matches the server's deadline; the
+  controller (`lib/client.js`) does the side effects: sending a fairness seed per upcoming hand,
+  requesting a resync on a gap in `seq`, verifying every proof in the browser. All three are unit tested
+  with fakes; none touch the DOM.
+- **Motion.** Cards are dealt from the pot and flip in 3D; board cards flip in one after another; bets
+  slide out to the felt and sweep into the pot; winnings fly to the winner. The turn timer is an SVG
+  ring drained by a CSS animation, so it costs no JavaScript per frame. Everything animates only
+  `transform` and `opacity`, and `prefers-reduced-motion` is honoured.
+- **Layout is pixel-aware.** A seat is anchored by its avatar centre; cards and nameplate hang off it at
+  fixed offsets, and the seat ring is computed from the real felt size (`lib/seats.js`), tested across
+  three phone heights, 2-9 players and every hero seat.
+- **Looked at, not just tested.** `bun run shots` drives a real phone-sized Chromium through login,
+  lobby, buy-in, a live table against bots, a raise, a result, the fairness sheet and the desktop gate,
+  and fails on console errors or content stuck at zero opacity (which Playwright otherwise counts as
+  visible). Reviewing its screenshots found, among others: hole cards wiped by message ordering,
+  white-on-white button text from an unlayered CSS reset, and a blank desktop gate from a missing
+  animation provider. Each is fixed and has a guard.
+
+Known gaps: the pot pill can touch one bet chip on the smallest (360x640) screens; there is no sound;
+the desktop QR points at the page's own origin, which a phone cannot reach if that is `localhost`.
+
 ## Measured capacity
 
 `bun apps/server/scripts/loadtest.js --tables N --clients 3 --seconds 15 --think 150`. One server
@@ -125,5 +155,5 @@ state is in memory, so a restart (or a watchdog kill) loses hands in flight.
 
 ## Status
 
-See README. Milestone 1: engine, server, mobile UI, play-money. Milestone 2: Foundry vault, session keys,
+Milestone 1 (engine, server, mobile UI, play-money) is complete. Milestone 2: Foundry vault, session keys,
 cashier, indexer (Polygon Amoy, BSC testnet). Milestone 3: scale hardening, audit prep.

@@ -1,7 +1,9 @@
 // HTTP side (Hono): login, lobby, health. Anything latency-sensitive uses the WebSocket instead.
 
+import { relative } from 'node:path';
 import { LIMITS } from '@pgg/protocol/constants';
 import { Hono } from 'hono';
+import { serveStatic } from 'hono/bun';
 import { cors } from 'hono/cors';
 import { signToken, verifyToken } from './auth.js';
 
@@ -35,6 +37,24 @@ export function createApp({ config, wallet, registry }) {
       : signToken(config.secret, { id, name, exp: Date.now() + config.tokenTtlMs });
     return c.json({ token, player: { id, name, balance: wallet.balance(id) ?? balance } });
   });
+
+  // The built web app, when there is one: hashed assets are immutable, the HTML is never cached,
+  // and any other path falls back to index.html so client-side routes survive a refresh.
+  if (config.webDist) {
+    const root = relative(process.cwd(), config.webDist) || '.';
+    app.use('/assets/*', async (c, next) => {
+      await next();
+      if (c.res.status === 200) c.header('Cache-Control', 'public, max-age=31536000, immutable');
+    });
+    app.use('/*', async (c, next) => {
+      await next();
+      if ((c.res.headers.get('content-type') ?? '').includes('text/html')) {
+        c.header('Cache-Control', 'no-cache'); // never cache the page that names the hashed assets
+      }
+    });
+    app.use('/*', serveStatic({ root }));
+    app.get('*', serveStatic({ root, path: 'index.html' }));
+  }
 
   return app;
 }

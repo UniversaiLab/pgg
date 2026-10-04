@@ -292,3 +292,41 @@ describe('playing', () => {
     expect(game.registry.get('high-1').chipsOnTable()).toBe(0);
   }, 40_000);
 });
+
+describe('serving the web app', () => {
+  test('static files, immutable assets and an SPA fallback, without shadowing the API', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'pgg-web-'));
+    mkdirSync(join(dir, 'assets'));
+    writeFileSync(
+      join(dir, 'index.html'),
+      '<!doctype html><title>PGG</title><div id="root"></div>',
+    );
+    writeFileSync(join(dir, 'assets', 'app-abc123.js'), 'console.log(1)');
+
+    const web = createGame({
+      ...loadConfig({ PORT: '0', HOST: '127.0.0.1', PGG_SECRET: 'x', WEB_DIST: dir }),
+    });
+    try {
+      const home = await fetch(`${web.url}/`);
+      expect(home.status).toBe(200);
+      expect(await home.text()).toContain('<div id="root">');
+      expect(home.headers.get('cache-control')).toContain('no-cache');
+
+      const asset = await fetch(`${web.url}/assets/app-abc123.js`);
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get('cache-control')).toContain('immutable');
+
+      const deep = await fetch(`${web.url}/some/client/route`);
+      expect(deep.status).toBe(200);
+      expect(await deep.text()).toContain('<div id="root">');
+
+      expect((await (await fetch(`${web.url}/api/health`)).json()).ok).toBe(true);
+      expect((await fetch(`${web.url}/ws`)).status).toBe(401); // still the WebSocket endpoint
+    } finally {
+      web.stop();
+    }
+  });
+});

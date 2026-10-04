@@ -17,7 +17,9 @@
     "lint": "biome check .",
     "format": "biome check --write .",
     "bots": "bun apps/server/scripts/bots.js",
-    "loadtest": "bun apps/server/scripts/loadtest.js"
+    "loadtest": "bun apps/server/scripts/loadtest.js",
+    "shots": "bun apps/web/scripts/shots.js",
+    "size": "bun apps/web/scripts/size.js"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.15"

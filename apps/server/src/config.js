@@ -19,10 +19,10 @@ function defaultTables() {
     rakeCap: smallBlind * 6,
   });
   return [
-    make('rookie-1', 'Rookie 5/10', 5, 200, 1000),
-    make('rookie-2', 'Rookie 5/10 II', 5, 200, 1000),
-    make('regular-1', 'Regular 25/50', 25, 1000, 5000),
-    make('high-1', 'High Roller 100/200', 100, 4000, 20000),
+    make('rookie-1', 'Rookie', 5, 200, 1000),
+    make('rookie-2', 'Rookie II', 5, 200, 1000),
+    make('regular-1', 'Regular', 25, 1000, 5000),
+    make('high-1', 'High Roller', 100, 4000, 20000),
   ];
 }
 
