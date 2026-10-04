@@ -25,6 +25,7 @@ bun test              # engine + server tests
 bun run dev:server    # game server
 bun run dev:web       # mobile client (open on a phone, or a phone-sized viewport)
 bun run lint
+bun run loadtest -- --tables 300 --clients 3   # load test; see docs/architecture.md
 ```
 
 ## Status

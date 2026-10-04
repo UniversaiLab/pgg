@@ -12,6 +12,7 @@
       "name": "@pgg/server",
       "version": "0.1.0",
       "dependencies": {
+        "@noble/hashes": "^2.4.0",
         "@pgg/engine": "workspace:*",
         "@pgg/protocol": "workspace:*",
         "hono": "^4.13.13",

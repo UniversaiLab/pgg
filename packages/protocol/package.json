@@ -3,9 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Single source of truth for client<->server message shapes (zod). Shared by server and web.",
+  "description": "Message shapes shared by server and web. The root entry has zod schemas (server); ./constants has none (web).",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./constants": "./src/constants.js"
   },
   "dependencies": {
     "zod": "^4.6.5"

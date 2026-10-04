@@ -7,6 +7,12 @@
   "dependencies": {
     "@pgg/engine": "workspace:*",
     "@pgg/protocol": "workspace:*",
-    "hono": "^4.13.13"
+    "hono": "^4.13.13",
+    "@noble/hashes": "^2.4.0"
+  },
+  "scripts": {
+    "start": "bun src/index.js",
+    "dev": "bun --hot src/index.js",
+    "bots": "bun scripts/bots.js"
   }
 }

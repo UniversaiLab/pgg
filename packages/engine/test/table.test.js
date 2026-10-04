@@ -116,7 +116,7 @@ describe('settlement', () => {
     expect(result.rake).toBe(15);
     expect(result.payouts).toEqual([{ seat: 0, gross: 300, rake: 15, net: 285 }]);
     expect(result.stacks).toEqual([1185, 0, 900, 0, 0, 900]);
-    expect(table.ledger()).toEqual({ handsPlayed: 1, potVolume: 300, rakeTaken: 15, repairs: 0 });
+    expect(table.ledger()).toEqual({ handsPlayed: 1, potVolume: 300, rakeTaken: 15, aborted: 0 });
     expect(result.reveals.map((r) => r.seat)).toEqual([0, 2, 5]);
   });
 
@@ -253,7 +253,7 @@ describe('settlement', () => {
       expect(table.lastHand().result.stacks).toEqual(expected);
     });
 
-    test('the table is repaired, not left with a deleted player', () => {
+    test('the short-stack winner keeps their seat and their winnings', () => {
       const table = play([
         ...preflop,
         [1, 'check'],
@@ -264,8 +264,8 @@ describe('settlement', () => {
         [3, 'check'],
       ]);
       const seats = table.snapshot(null).seats;
-      expect(seats[0]).toMatchObject({ seat: 0, chips: 16 }); // not null, not busted
-      expect(table.ledger().repairs).toBeGreaterThan(0); // poker-ts got it wrong; we fixed it
+      expect(seats[0]).toMatchObject({ seat: 0, chips: 16 }); // poker-ts would have deleted it
+      expect(table.bustedSeats()).toEqual([]);
     });
   });
 
@@ -349,6 +349,118 @@ describe('action validation', () => {
   });
 });
 
+describe('stacks, button and aborts', () => {
+  const dealHand = (table, handNo) => table.startHand({ deck: [...CANONICAL_DECK], handNo });
+  const foldAround = (table) => {
+    while (table.inHand) table.act(table.toAct, 'fold');
+  };
+
+  test('the button rotates through occupied seats and skips empty ones', () => {
+    const table = threeHanded(); // seats 0, 2, 5
+    const buttons = [];
+    for (let handNo = 1; handNo <= 7; handNo++) {
+      dealHand(table, handNo);
+      buttons.push(table.snapshot(null).button);
+      foldAround(table);
+    }
+    expect(buttons).toEqual([0, 2, 5, 0, 2, 5, 0]);
+  });
+
+  test('the button moves on when its owner leaves', () => {
+    const table = threeHanded();
+    dealHand(table, 1); // button 0
+    foldAround(table);
+    table.standUp(2);
+    dealHand(table, 2);
+    expect(table.snapshot(null).button).toBe(5); // seat 2 is empty, so next is seat 5
+    expect(table.snapshot(null).seats[2]).toBeNull();
+  });
+
+  test('seating works on the table between hands, and not during one', () => {
+    const table = threeHanded();
+    expect(table.chipsAt(0)).toBe(1000);
+    expect(table.chipsAt(1)).toBeNull();
+    table.topUp(0, 250);
+    expect(table.chipsAt(0)).toBe(1250);
+    expect(table.standUp(0)).toBe(1250);
+    expect(table.chipsAt(0)).toBeNull();
+    expect(table.totalChips()).toBe(2000);
+    expect(() => table.standUp(0)).toThrow(IllegalActionError);
+    expect(() => table.topUp(0, 10)).toThrow(IllegalActionError);
+    expect(() => table.sitDown(2, 10)).toThrow(IllegalActionError); // taken
+    dealHand(table, 1);
+    expect(() => table.topUp(2, 10)).toThrow(IllegalActionError);
+  });
+
+  test('aborting a hand refunds everyone and the table carries on', () => {
+    const table = threeHanded({ rake: { bps: 300 } });
+    dealHand(table, 1);
+    table.act(table.toAct, 'raise', 400);
+    expect(table.totalChips()).toBe(3000);
+    const { events } = table.abortHand('test');
+    expect(events).toEqual([{ type: 'hand-aborted', handNo: 1, reason: 'test' }]);
+    expect(table.inHand).toBe(false);
+    for (const seat of [0, 2, 5]) expect(table.chipsAt(seat)).toBe(1000);
+    expect(table.lastHand()).toBeNull();
+    expect(table.ledger()).toMatchObject({ handsPlayed: 0, rakeTaken: 0, aborted: 1 });
+    expect(table.abortHand().events).toEqual([]); // nothing to abort now
+    dealHand(table, 2); // and the next hand deals normally
+    playOut(table);
+    expect(table.totalChips() + table.ledger().rakeTaken).toBe(3000);
+  });
+
+  test('all-in players keep their claim on the pot through later betting rounds', () => {
+    // Seats 0 and 2 are short stacks that go all-in on the flop and tie (A-K high). Seats 3 and 5
+    // stay in and keep betting. Seat 1 folds the small blind, making the pot odd (249).
+    // poker-ts 1.5.0 drops the all-in seats from the pot and awards all 249 to seat 5, who lost.
+    const table = new PokerTable({ tableId: 'r', numSeats: 6, smallBlind: 5, bigBlind: 10 });
+    for (const [seat, chips] of [
+      [0, 61],
+      [1, 1000],
+      [2, 61],
+      [3, 1000],
+      [5, 1000],
+    ]) {
+      table.sitDown(seat, chips);
+    }
+    table.startHand({
+      deck: craftDeck(
+        [
+          ['As', 'Kd'],
+          ['2h', '3h'],
+          ['Ah', 'Kc'],
+          ['4d', '5h'],
+          ['6d', '7c'],
+        ],
+        ['2c', '9h', 'Jc', 'Qd', '3s'],
+      ),
+      handNo: 1,
+    });
+    const script = [
+      [3, 'call'],
+      [5, 'call'],
+      [0, 'call'],
+      [1, 'fold'],
+      [2, 'check'],
+      [2, 'bet', 51],
+      [3, 'call'],
+      [5, 'call'],
+      [0, 'call'],
+      [3, 'check'],
+      [5, 'check'],
+      [3, 'check'],
+      [5, 'check'],
+    ];
+    for (const [seat, action, amount] of script) table.act(seat, action, amount);
+    const { result } = table.lastHand();
+    // 249 split two ways; the odd chip goes to the first winner clockwise from the button (seat 2).
+    expect(result.stacks).toEqual([124, 995, 125, 939, 0, 939]);
+    expect(result.pots.map((p) => [p.size, p.eligible, p.winners.map((w) => w.seat)])).toEqual([
+      [249, [0, 2, 3, 5], [0, 2]],
+    ]);
+  });
+});
+
 describe('information hiding', () => {
   test("a seat's snapshot never contains another seat's hole cards", () => {
     const table = threeHanded();
@@ -368,6 +480,26 @@ describe('information hiding', () => {
     for (const card of ['"As"', '"Ah"', '"Ks"', '"Kh"', '"Qs"', '"Qh"']) {
       expect(spectator).not.toContain(card);
     }
+  });
+
+  test('a bet range is only reported when betting or raising is actually legal', () => {
+    // Seat 2 has 150 chips (100 left after the small blind) facing a raise to 500: it can only
+    // call all-in or fold. poker-ts still reports a range; we must not pass it on.
+    const table = threeHanded({}, [1000, 150, 1000]);
+    table.startHand({ deck: [...CANONICAL_DECK], handNo: 1 });
+    table.act(0, 'raise', 500);
+    const legal = table.snapshot(2).legal;
+    expect(legal.actions).not.toContain('raise');
+    expect(legal.actions).not.toContain('bet');
+    expect(legal.min).toBeUndefined();
+    expect(legal.max).toBeUndefined();
+    expect(legal.toCall).toBe(100); // all it has left
+
+    const open = threeHanded();
+    open.startHand({ deck: [...CANONICAL_DECK], handNo: 1 });
+    const free = open.snapshot(0).legal;
+    expect(free.actions).toContain('raise');
+    expect(free.min).toBeLessThanOrEqual(free.max);
   });
 
   test('legal actions are only offered to the seat on the clock', () => {
@@ -394,7 +526,7 @@ describe('fuzz: random legal play', () => {
   const HANDS = Number(process.env.FUZZ_HANDS ?? 300);
   const SEED = Number(process.env.FUZZ_SEED ?? 2024);
 
-  test(`${HANDS} hands: chips conserved, proofs verify, our settlement agrees with poker-ts`, () => {
+  test(`${HANDS} hands: chips conserved, proofs verify, winners match the reference evaluator`, () => {
     const rand = makeRand(SEED);
     const table = new PokerTable({
       tableId: 'fuzz',
@@ -411,9 +543,6 @@ describe('fuzz: random legal play', () => {
     let showdowns = 0;
     let multiPot = 0;
     let rakeSeen = 0;
-    let compared = 0;
-    let engineWrong = 0;
-    let repaired = 0;
 
     for (let handNo = 1; handNo <= HANDS; handNo++) {
       // Keep at least 3 players with a mix of deep and short stacks.
@@ -429,8 +558,10 @@ describe('fuzz: random legal play', () => {
       const deck = dealer.deal(handNo);
       table.startHand({ deck, handNo });
 
+      const chipsBefore = table.totalChips();
       for (let guard = 0; table.inHand; guard++) {
         expect(guard).toBeLessThan(300);
+        expect(table.totalChips(), `hand ${handNo} mid-hand`).toBe(chipsBefore);
         const seat = table.snapshot(null).toAct;
         const legal = table.snapshot(seat).legal;
         const roll = rand(100);
@@ -463,46 +594,32 @@ describe('fuzz: random legal play', () => {
       expect(verifyHand({ ...proof, dealt }).ok, where).toBe(true);
 
       rakeSeen += result.rake;
-      if (result.audit.repaired) repaired++;
       if (result.reveals.length > 1) {
         showdowns++;
         if (result.pots.length > 1) multiPot++;
         // Our settlement (pokersolver) must match a brute-force reference evaluator on every pot.
-        // poker-ts is only a third opinion: where it built the same pot and still disagrees, the
-        // reference arbitrates (poker-ts mis-ranks double trips, for example).
-        const seatsOf = (list) =>
-          list.map((w) => (typeof w === 'number' ? w : w.seat)).sort((a, b) => a - b);
         const hole = new Map(result.reveals.map((r) => [r.seat, r.cards]));
-        result.pots.forEach((pot, index) => {
-          if (pot.eligible.length < 2) return;
+        for (const pot of result.pots) {
+          if (pot.eligible.length < 2) continue;
           const reference = referenceWinners(
             pot.eligible.map((seat) => [seat, hole.get(seat)]),
             result.board,
           );
-          expect(seatsOf(pot.winners), where).toEqual(reference);
-          const theirs = result.audit.enginePots[index];
-          const theirWinners = result.audit.engineWinners[index];
-          const sameShape =
-            theirs &&
-            theirs.size === pot.size &&
-            theirs.eligiblePlayers.join() === pot.eligible.join();
-          if (sameShape && theirWinners?.length) {
-            compared++;
-            if (seatsOf(theirWinners).join() !== reference.join()) engineWrong++;
-          }
-        });
+          expect(
+            pot.winners.map((w) => w.seat).sort((a, b) => a - b),
+            where,
+          ).toEqual(reference);
+        }
       }
     }
 
     // The run must actually exercise the interesting paths, or the checks above prove little.
     expect(showdowns).toBeGreaterThan(HANDS / 8);
     expect(multiPot).toBeGreaterThan(HANDS / 100);
-    expect(compared).toBeGreaterThan(HANDS / 8);
     expect(rakeSeen).toBeGreaterThan(0);
-    expect(table.ledger().repairs).toBe(repaired);
     if (process.env.FUZZ_REPORT) {
       console.log(
-        `fuzz: ${HANDS} hands, ${showdowns} showdowns, ${multiPot} multi-pot, poker-ts wrong on ${engineWrong}/${compared} comparable pots, ${repaired} hands repaired`,
+        `fuzz: ${HANDS} hands, ${showdowns} showdowns, ${multiPot} multi-pot, ${rakeSeen} rake`,
       );
     }
   }, 600_000); // long runs (FUZZ_HANDS) are synchronous; the default 5s timeout would flag them
