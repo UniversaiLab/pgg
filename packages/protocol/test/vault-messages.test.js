@@ -256,6 +256,7 @@ describe('wire names are part of the protocol', () => {
     expect(SERVER.BUNDLE).toBe('bundle');
     expect(ERR.NOT_VAULT_TABLE).toBe('not-vault-table');
     expect(ERR.BAD_CLAIM).toBe('bad-claim');
+    expect(ERR.CLAIM_PENDING).toBe('claim-pending');
     expect(ERR.BAD_SIGNATURE).toBe('bad-signature');
     expect(ERR.VAULT_LOCKED).toBe('vault-locked');
   });

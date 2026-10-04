@@ -60,6 +60,8 @@ export const ERR = Object.freeze({
   // Vault tables only. None of these may fire during normal play.
   NOT_VAULT_TABLE: 'not-vault-table',
   BAD_CLAIM: 'bad-claim',
+  // The deposit exists on chain but is not confirmed deep enough yet: the client retries, it is not a refusal.
+  CLAIM_PENDING: 'claim-pending',
   BAD_SIGNATURE: 'bad-signature',
   VAULT_LOCKED: 'vault-locked',
 });
