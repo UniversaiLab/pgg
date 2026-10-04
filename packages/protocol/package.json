@@ -1,0 +1,13 @@
+{
+  "name": "@pgg/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Single source of truth for client<->server message shapes (zod). Shared by server and web.",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@pgg/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hono + Bun.serve WebSocket game server. Tables are single-writer actors.",
+  "dependencies": {
+    "@pgg/engine": "workspace:*",
+    "@pgg/protocol": "workspace:*",
+    "hono": "^4.13.13"
+  }
+}

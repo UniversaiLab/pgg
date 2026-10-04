@@ -1,20 +1,13 @@
-**/node_modules
-**/static
-**/31337
-**/1337
-**.code-workspace
-**.env
-**.DS_Store
-**yarn.lock
-**package-lock.json
-**yarn-error.log
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
 
-blockchain/coverage
-blockchain/coverage.json
-blockchain/typechain
-blockchain/typechain-types
-blockchain/cache
-blockchain/artifacts
-
-client/.next
-
+# Foundry (contracts/)
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/

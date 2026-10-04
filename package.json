@@ -1,29 +1,24 @@
 {
-  "name": "pok3r",
-  "version": "1.0.0",
-  "description": ">P2P Multiplayer Poker Powered by Web3",
+  "name": "pgg",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mobile-only Web3 poker. Derived from pok3rNetwork/pok3r (MIT).",
+  "license": "MIT",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "setup": "node ./util/install.js",
-    "rest": "nodemon ./api/app.js",
-    "localChain": "npx hardhat node",
-    "getBalances": "npx hardhat run ./blockchain/scripts/balances.js",
-    "deploy": "npx hardhat run ./blockchain/scripts/deploy.js"
+    "dev:server": "bun --hot apps/server/src/index.js",
+    "dev:web": "bun --cwd apps/web run dev",
+    "build:web": "bun --cwd apps/web run build",
+    "test": "bun test",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "bots": "bun apps/server/scripts/bots.js"
   },
-  "author": "",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/pok3rNetwork/pok3r/issues"
-  },
-  "homepage": "https://github.com/pok3rNetwork/pok3r#readme",
-  "dependencies": {
-    "@chainlink/contracts": "^0.4.1",
-    "@nomicfoundation/hardhat-toolbox": "^2.0.0",
-    "@openzeppelin/contracts": "^4.7.3",
-    "dotenv": "^16.0.2",
-    "ethers": "^5.7.1",
-    "hardhat": "^2.11.2",
-    "holdem-poker": "^0.2.0",
-    "nodemon": "^2.0.19"
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15"
   }
 }
