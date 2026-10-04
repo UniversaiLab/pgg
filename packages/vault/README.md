@@ -24,8 +24,8 @@ import { hashState, checkState, clientShouldSign /* ... */ } from '@pgg/vault';
 | **Domain** | `{ chainId: number, verifyingContract: lowercase address }`. The contract name and version are fixed. |
 | **Signature** | `'0x'` + 130 hex: `r \|\| s \|\| v`, 65 bytes, `v` 27 or 28, low-s. |
 | **Digest** | `'0x'` + 64 hex. |
-| **Addresses** | Lowercased inside the library; any case is accepted on input. |
-| **Errors** | Validation failures throw a `RangeError` whose message starts with the field (`nonce is out of range for uint64`, `players[2] must be above players[1] (strictly ascending)`). The `check*`, `verifyBundle` and rule predicates do not throw on bad *input*; they return a result. A bad *argument* (a broken `ctx`, a non-function `sessionKeyOf`) is a caller bug and throws. |
+| **Addresses** | Lowercased inside the library; any case is accepted on input. Every `sessionKeyOf(playerAddress)` callback you pass is called with a **lowercase** address, so a `Map` keyed by lowercase addresses works as it is. |
+| **Errors** | Validation failures throw a `RangeError` whose message starts with the field (`nonce is out of range for uint64`, `players[2] must be above players[1] (strictly ascending)`). An array with a hole (`new Array(3)`, `delete a[1]`) is refused like any other bad element, and an array longer than a table can have is refused before anything walks it. The `check*`, `verifyBundle` and rule predicates do not throw on bad *input*; they return a result. A bad *argument* (a broken `ctx`, a non-function `sessionKeyOf`, a malformed `expect`) is a caller bug and throws. |
 | **Chips and tokens** | The game counts whole chips (numbers); the vault counts token base units (`bigint`). `unit` is the number of base units per chip. A deposit need not be a multiple of the unit: the remainder (dust) stays on the player's balance and conserves exactly. |
 
 ## API
@@ -39,13 +39,15 @@ import { hashState, checkState, clientShouldSign /* ... */ } from '@pgg/vault';
 ### `state.js`
 
 - `normalizeState(raw) -> State`. Checks and canonicalises: uint64 nonce, uint256 amounts, bytes32 `tableId`,
-  20-byte addresses, equal array lengths, 2 to 10 players, strictly ascending, first player not zero. Accepts
-  safe-integer numbers for number fields. Returns a new object.
+  20-byte addresses, equal array lengths (an array of more than 10 entries is refused before it is read), 2 to
+  10 players, strictly ascending, first player not zero, no holes in any array. Accepts safe-integer numbers
+  for number fields. Returns a new object.
 - `decodeState(raw)`. Only what the contract's ABI decoder would check (types and ranges). Used by `checkState`
   so a state with a bad roster gets the contract's error instead of an exception.
 - `toWire(state)`, `fromWire(wire)`. `fromWire` is strict: a number must be a string of digits, no leading zero
-  (except `'0'`), no sign, no whitespace, no `0x`, no decimal point; JSON numbers are refused.
-- `statesEqual(a, b)`, `normalizeAddress(a)`, `compareAddress(a, b)` (numeric), `isStrictlyAscending(list)`.
+  (except `'0'`), no sign, no whitespace, no `0x`, no decimal point; JSON numbers are refused. The three arrays
+  are length-checked before any element is converted, so a 2-million-entry array costs one comparison.
+- `statesEqual(a, b)` (never throws; a hole is equal to nothing), `normalizeAddress(a)`, `compareAddress(a, b)` (numeric), `isStrictlyAscending(list)`.
 - `rosterHash(players)`: `keccak256` of the 32-byte-padded concatenation, exactly the contract's `rosterHash`.
 - `MIN_PLAYERS`, `MAX_PLAYERS`.
 
@@ -59,13 +61,27 @@ import { hashState, checkState, clientShouldSign /* ... */ } from '@pgg/vault';
 
 ### `build.js`
 
-- `genesisState({ tableId, players, deposits, nonce = 0n, rake = 0n })`. What `startExitFromDeposits` and
-  `depositState` use: `isFinal` false, `keep` all false, `volume` 0. `players` must already be the roster in
-  ascending order; `deposits[i]` belongs to `players[i]`. Pass the table's `nonce` and `rakePaid` for a
-  rolled-over epoch.
+- **Which baseline?** `rake` and `volume` are cumulative since the table was created, and two different states
+  start from the deposits, so there are two builders over one internal one:
+
+  | Builder | For | `nonce` / `rake` | `volume` |
+  | --- | --- | --- | --- |
+  | `depositState({ tableId, players, deposits, nonce = 0n, rake = 0n })` | The synthetic state `startExitFromDeposits` puts up; its digest must equal `PokerVault.depositState`. Compare an exit against it, or finalise one. | the table's `nonce` and `rakePaid` | **always 0** (the vault does not store volume; passing a `volume` option throws) |
+  | `epochBaseline({ tableId, players, deposits, nonce, rake, volume })` | The baseline for the **first hand of a new epoch**, and the `baseline` of the client view. | the table's `nonce` and `rakePaid` | the cumulative volume of the final state that closed the previous epoch |
+
+  `epochBaseline` requires all three of `nonce`, `rake` and `volume` (write `0n` for a brand-new table), because
+  a silent default is the trap: the vault checks `rake * 10000 <= MAX_RAKE_BPS * volume` on the **cumulative**
+  numbers, so a rolled-over epoch whose baseline has `rake = rakePaid` but `volume = 0` makes the next hand at
+  2% of its own pot `RakeTooHigh` (proved against the contract on anvil in `test/review-chain.test.js`).
+  The vault does not store volume, so take it from the final bundle you hold (C3 says to keep the newest
+  all-signed state durably), never from a message the other side sends you. `deposits[i]` belongs to
+  `players[i]`: a stayer's balance from that final state, a new player's deposit.
+- `genesisState({ tableId, players, deposits, nonce = 0n, rake = 0n, volume = 0n })`. The general form behind
+  both, kept so existing callers work. Prefer the two above: they say which one you mean.
 - `buildNextState({ prev, balances, rakeDelta = 0n, volumeDelta = 0n, final = false, keep })`. `nonce = prev.nonce + 1n`,
-  same roster, `rake` and `volume` advanced by the deltas. A final state takes `keep` (default: nobody stays);
-  a state that is not final always has `keep` all false. It does **not** check the money: run `checkState`.
+  same roster, `rake` and `volume` advanced by the deltas. `final` must be a boolean (the string `'false'` is a
+  `RangeError`, not a final state). A final state takes `keep` (default: nobody stays); a state that is not
+  final always has `keep` all false. It does **not** check the money: run `checkState`.
 - `sortRoster(items) -> { sorted, order, position }` for `{ address, ... }` objects. `order[j]` is the input
   index at state index `j`; `position[i]` is the state index of input `i`. Duplicates throw.
 
@@ -85,7 +101,7 @@ checkSettle(state, sigs, ctx) -> the same
   {
     domain,                         // { chainId, verifyingContract }
     maxRakeBps,                     // number or bigint: the vault's MAX_RAKE_BPS
-    sessionKeyOf(playerAddress),    // -> the seat's on-chain session key, or null
+    sessionKeyOf(playerAddress),    // -> the seat's on-chain session key, or null (called with a LOWERCASE address)
     table: {                        // the contract's tables(id) row
       nonce, escrow, rakePaid,      // bigint (numbers accepted)
       rosterHash, arbiter,
@@ -109,38 +125,57 @@ checkSettle(state, sigs, ctx) -> the same
 - Not checked, because they depend on the entry point: `startExit` needs status Active and a member or the
   arbiter; `challenge` needs Exiting and an open window; `finalizeExit` needs the exit digest.
 - `ERRORS`: every error name with `source`, `params`, `signature` and 4-byte `selector`. `STATUS`: the enum.
+  `RAKE_BPS_CEILING` (500): `PokerVault.RAKE_BPS_CEILING`, the highest `MAX_RAKE_BPS` a vault can be built with
+  (`test/rake-ceiling.test.js` compares it with the contract source).
 
 ### `bundle.js`
 
 A bundle is a State with every signature: `{ domain, state, arbiterSig, playerSigs }`. It is the only thing
 the contract accepts, so servers and clients keep the newest one durably.
 
-- `makeBundle({ domain, state, arbiterSig, playerSigs })`: validates the shape (65-byte signatures, one per player).
-- `verifyBundle(bundle, { arbiter, sessionKeyOf }) -> { ok: true, digest } | { ok: false, error, args }`. The
-  digest is recomputed; the arbiter and every player are recovered and compared, in the contract's order, with
-  the contract's errors. A bad bundle is a result (`Malformed` or `BadLength`); a bad `arbiter` or `sessionKeyOf`
-  argument is a caller bug and throws. It does not know the
-  table, so it cannot say whether the state is newer or conserves the escrow (that is `checkState`).
+- `makeBundle({ domain, state, arbiterSig, playerSigs })`: validates the shape (65-byte signatures, one per player,
+  no holes).
+- `verifyBundle(bundle, { arbiter, sessionKeyOf, expect? }) -> { ok: true, digest } | { ok: false, error, args }`.
+  The digest is recomputed; the arbiter and every player are recovered and compared, in the contract's order,
+  with the contract's errors (`sessionKeyOf` is called with lowercase addresses). A bad bundle is a result
+  (`Malformed` or `BadLength`), never an exception; a bad `arbiter`, `sessionKeyOf` or `expect` argument is a
+  caller bug and throws. It does not know the table's row, so it cannot say whether the state is newer or
+  conserves the escrow (that is `checkState`).
+
+  **`expect = { domain, tableId, players }`** (any of them, at least one; a key that is present but `undefined`
+  throws, so a variable that was never set cannot silently skip the check). The signatures only prove the
+  bundle is consistent with *its own* domain and table. The browser has no chain access, so without `expect` a
+  bundle that was legitimately signed for another chain, vault, table or roster (the same session keys) would
+  verify, and a hostile server could shadow the real newest bundle with it. With `expect`, a mismatch is
+  reported before any signature is read: `{ ok: false, error: 'WrongDomain' | 'WrongTable' | 'WrongRoster',
+  args: [what the bundle is for] }` (the names are exported as `EXPECT_ERRORS`).
 - `bundleToWire(bundle)`, `bundleFromWire(wire)` (strict), `bundleDigest(bundle)`.
-- `isNewer(a, b)`: strictly higher nonce; anything is newer than `null`. Equal nonces with different digests
-  are an alarm, not an update, and are the caller's to raise.
+- `isNewer(a, b)`: strictly higher nonce; anything is newer than `null`. Nonces are compared **as numbers**: a
+  `bigint`, a safe-integer number and a decimal string (the wire form, so `'10'` is newer than `'9'`) all work;
+  anything else, or a value above uint64, throws `TypeError` rather than guess. Equal nonces with different
+  digests are not newer either way.
+- `bundleConflict(a, b) -> null | { nonce, digests: [digestOfA, digestOfB] }`. The alarm case `isNewer` cannot
+  express: two bundles for the same table and domain with the **same nonce and different digests**. An honest
+  arbiter signs one state per nonce, so two fully signed states at one nonce mean a bug, a restart that lost its
+  record, or a key compromise. Run it on bundles that passed `verifyBundle`. Different tables, domains or
+  nonces, or the very same state, give `null`. A value that is not an internal-form bundle throws `RangeError`.
 
 ### `rules.js`: the rules in `docs/trust-model.md`
 
 | Id | Rule | Where |
 | --- | --- | --- |
-| **C1a** | Sign only a nonce above the last one signed, or the identical digest again; never two digests at one nonce. | `clientShouldSign`, `decideSign` |
-| **C1b** | Every balance, the rake and the volume move by exactly what the client saw at the table. | `clientShouldSign` |
-| **C1c** | Balances plus rake equal the last all-signed baseline's balances plus rake. | `clientShouldSign` |
-| **C1d** | Same table, roster and domain as pinned; the client computes the digest itself. | `clientShouldSign` |
+| **C1a** | Sign only the very next nonce after the newest state you hold (default step 1, `maxNonceGap`), or the identical digest again; never two digests at one nonce. | `clientShouldSign`, `decideSign` |
+| **C1b** | Every balance, the rake and the volume move by exactly what the client saw at the table since the base state. | `clientShouldSign` |
+| **C1c** | Balances plus rake equal the base state's balances plus rake. | `clientShouldSign` |
+| **C1d** | Same table, roster and domain as pinned; the client computes the digest itself and signs that one. | `clientShouldSign` |
 | **C1e** | Rake never decreases and stays within `maxRakeBps` of cumulative volume. | `clientShouldSign` |
-| **C2** | A final state only when leaving or rotating, and nothing higher after it in the epoch. | `clientShouldSign`, `decideSign` |
-| **S1** | No next hand before the last state has every signature. | `canDeal`, `dealBlocker` |
+| **C2** | A final state only when leaving or rotating, nothing at all after one in the epoch (signed by me or all-signed as the baseline), and no keep flag in a state that is not final. | `clientShouldSign`, `decideSign` |
+| **S1** | No next hand before the last state has every signature, verified for this table and domain. | `canDeal`, `dealBlocker` |
 | **S3** | No co-signing with a session key past its policy expiry. | `serverMayCoSign` |
 | **S4** | Never two states at one nonce (the arbiter uses `decideSign` too). | `decideSign` |
 
 (C3, store the newest all-signed state durably, and C4/S2, watch for stale exits, are behaviours rather than
-predicates; the helpers are `isNewer` and `verifyBundle`.)
+predicates; the helpers are `isNewer`, `bundleConflict` and `verifyBundle`.)
 
 **`decideSign({ req, last }) -> 'new' | 'repeat' | 'refuse-lower' | 'refuse-equivocation' | 'refuse-after-final'`**
 
@@ -149,9 +184,14 @@ predicates; the helpers are `isNewer` and `verifyBundle`.)
   flag does not outlive its epoch.
 - `new`: sign, and write the record **before** sending the signature. `repeat`: same nonce and digest, send the
   same signature again (signing is deterministic). The refusals are as named; `refuse-after-final` also covers
-  any higher nonce after a final. Bad arguments throw `TypeError`.
+  any higher nonce after a final. Bad arguments throw `TypeError`. It only compares numbers: how far the nonce
+  jumps is `clientShouldSign`'s business (below).
 
-**`clientShouldSign(req, view) -> { ok: true } | { ok: false, rule, detail }`**
+**`clientShouldSign(req, view) -> { ok: true, digest } | { ok: false, rule, detail }`**
+
+A yes carries `digest`, the digest this function computed itself from the state under the **pinned** domain.
+Sign that digest and nothing else, never one the server supplied; a request that names a different digest is a
+refusal (`C1d`), not a yes.
 
 ```js
 req = {
@@ -165,33 +205,65 @@ view = {          // what THIS client knows, none of it taken from the request
   tableId,        // pinned
   roster,         // pinned, ascending: the players the contract started the epoch with
   unit,           // bigint, token base units per chip
-  maxRakeBps,     // number, from the vault
-  baseline,       // State: the newest all-signed state, or the genesis state built from the deposits
-  last,           // null | { nonce, digest, isFinal }: the durable record read by decideSign
+  maxRakeBps,     // integer 0..500 (RAKE_BPS_CEILING), from the vault
+  baseline,       // State: the newest all-signed state of THIS epoch, or the epoch baseline (see
+                  //   epochBaseline). Never a final state: once one is all-signed the epoch is over, and a
+                  //   request that extends it is refused (C2); after the settle use the next epoch's baseline
+  last,           // null | { nonce, digest, isFinal, state? }: the durable record read by decideSign.
+                  //   `state` is the full State I signed. REQUIRED when `last.nonce` is above the baseline's
+                  //   nonce (I signed a hand whose round is still open): the money is then judged against it.
   intent,         // 'play' | 'leave' | 'rotate': leave = I asked to leave; rotate = a rotation is due
-  observed,       // null | { deltas, rake, pot }: the hand I watched, in CHIPS (number or bigint);
-                  //   deltas[i] is the chips player i (state order) won or lost, rake and pot are chips.
-                  //   null means no hand was seen: every delta, the rake and the pot are 0.
+  observed,       // null | { deltas, rake, pot }: what happened at the table SINCE THE BASE STATE, in CHIPS
+                  //   (number or bigint); deltas[i] is the chips player i (state order) won or lost, rake and
+                  //   pot are chips and not negative. null means no hand was seen: all of them are 0.
+  myBalance,      // optional bigint: my balance at the baseline in token units, from MY OWN records
+  maxNonceGap,    // optional integer >= 1, default 1: how far above the newest state held a nonce may be
 }
 ```
 
-Checked in this order (cheap structure first, then the money from the coarsest invariant to the exact amounts).
-`rule` is one of `MALFORMED` (the request is not a valid State), `VIEW` (the client's view is unusable),
-`C1d`, `C1a`, `C2`, `C1e`, `C1c`, `C1b`, or `INTERNAL` (an unexpected exception: it fails closed).
+**The base state.** The money checks (`C1e`, `C1c`, `C1b`) compare the request with the *base*: the state in
+`last.state` when `last.nonce` is above `baseline.nonce` (I signed it, its round is still collecting
+signatures), otherwise `baseline`. So the next request cannot rewind a hand I already signed, whatever the
+ledger reports, and `observed` is measured from the base: the hands since the state I signed, or since the
+baseline when I signed nothing newer. A `last` that is ahead of the baseline but carries no `state` is a `VIEW`
+refusal (the nonce refusals, `C1a` and `C2`, still apply first). The record must describe itself truthfully
+(`state` for this table and roster, `state.nonce === last.nonce`, `state.isFinal === last.isFinal`, and
+`state` hashes to `last.digest` under the pinned domain), or it is a `VIEW` refusal.
 
-1. `C1d`: table, roster, `req.domain`, `req.digest` against the pinned values; the digest is computed with the pinned domain.
-2. `C1a`: via `decideSign`. An identical digest returns `{ ok: true }` at once (the client already vouched for it); a
-   lower nonce or a second digest at one nonce is refused; the nonce must also beat the baseline's. A higher
-   nonce after a signed final is `C2`.
-3. `C2`: a final state needs `intent` `leave` or `rotate`; when leaving, `keep[me]` must be false; no kept seat
-   may have a zero balance (`settle` would revert with `BadKeep`).
-4. `C1e`: `rake >= baseline.rake` and `rake * 10000 <= maxRakeBps * volume`.
-5. `C1c`: `sum(balances) + rake == sum(baseline.balances) + baseline.rake`.
-6. `C1b`: `balances[i] - baseline.balances[i] == deltas[i] * unit` for every seat, `rake - baseline.rake == observed.rake * unit`,
-   `volume - baseline.volume == observed.pot * unit`.
+**`myBalance` (baseline trust).** The baseline normally arrives in the server's `epoch` message. A lying one
+that moves my chips to another seat would pass every money check, because they are all relative to it. When
+`myBalance` is given and `baseline.balances[me]` differs, the answer is a `VIEW` refusal. The web step must fill
+it from the client's **own** record of its balance (its deposit for the first epoch; the balance in the final
+state it signed for a rolled-over one; later the balance in the last all-signed state it verified itself), never
+from the server's `epoch` message.
+
+Checked in this order (cheap structure first, then the money from the coarsest invariant to the exact amounts).
+`rule` is one of `MALFORMED` (the request is not a valid State), `VIEW` (the client's view is unusable or
+contradicts what the client knows), `C1d`, `C1a`, `C2`, `C1e`, `C1c`, `C1b`, or `INTERNAL` (an unexpected
+exception: it fails closed).
+
+1. `VIEW`: the view and the record are readable and consistent: `me` is on the roster, the baseline is for this
+   table and roster, `myBalance` (if given) agrees with the baseline, `last.state` (if given) is what `last`
+   says it is.
+2. `C1d`: table, roster, `req.domain`, `req.digest` against the pinned values; the digest is computed with the pinned domain.
+3. `C1a`: via `decideSign`. An identical digest returns `{ ok: true, digest }` at once (the client already vouched
+   for it); a lower nonce or a second digest at one nonce is refused; the nonce must also beat the baseline's and
+   be at most `maxNonceGap` above the newest state held (baseline or signed). An honest server steps the nonce by
+   one; a bigger jump is refused because at the extreme one signature would burn the whole uint64 space, and no
+   later state could follow it or challenge an exit from it. Raise `maxNonceGap` only if a server is known to
+   skip nonces. A higher nonce after a signed final is `C2`.
+4. `C2`: nothing may follow a final baseline; a final state needs `intent` `leave` or `rotate`; when leaving,
+   `keep[me]` must be false; no kept seat may have a zero balance (`settle` would revert with `BadKeep`); a state
+   that is not final must have every `keep` false (the contract reads `keep` only in `settle`, but the digest
+   covers it, so a server could mint many digests for one economic state).
+5. `C1e`: `rake >= base.rake` and `rake * 10000 <= maxRakeBps * volume`.
+6. `C1c`: `sum(balances) + rake == sum(base.balances) + base.rake`.
+7. `C1b`: `balances[i] - base.balances[i] == deltas[i] * unit` for every seat, `rake - base.rake == observed.rake * unit`,
+   `volume - base.volume == observed.pot * unit`.
 
 **`serverMayCoSign({ sessionKeyAgeMs, policyMaxMs }) -> boolean`** (S3). True while the age is within the maximum
-(equal is allowed). Anything that is not a finite non-negative number is `false`. The caller does the clock.
+(equal is allowed). Anything that is not a finite non-negative number, including no argument or `null`, is `false`.
+The caller does the clock.
 
 **`canDeal(view) -> boolean`** and **`dealBlocker(view) -> null | { reason, detail }`** (S1)
 
@@ -199,27 +271,37 @@ Checked in this order (cheap structure first, then the money from the coarsest i
 view = {
   active,         // boolean: the epoch is Active
   roundOpen,      // boolean: a sign round is still collecting signatures
-  head,           // bigint | null: nonce of the newest state proposed this epoch; null before the first hand ends
+  head,           // bigint | null: nonce of the newest state proposed this epoch. REQUIRED: null (explicitly)
+                  //   means no hand has ended yet; a missing or undefined head is a bad view, never an open gate
   bundle,         // the newest all-signed bundle | null
   members,        // [{ claimed: boolean, online: boolean }], one per roster seat (online = recently connected)
-  verify,         // optional { arbiter, sessionKeyOf }: also run verifyBundle on `bundle`
+  verify,         // REQUIRED { arbiter, sessionKeyOf }: the gate runs verifyBundle on `bundle` itself
+  tableId,        // REQUIRED: the table this gate is for
+  domain,         // REQUIRED: { chainId, verifyingContract }
+  roster,         // optional [address]: if given, the bundle must be for exactly this roster
 }
 ```
 
 `true` only if the epoch is active, no round is open, every member has claimed their seat and is online, and
-either nothing has been proposed yet (`head` is null) or `bundle.state.nonce === head`, that state is not final,
-and the bundle carries the arbiter's and every player's signature. Reasons, in the order they are checked:
-`bad-view`, `not-active`, `round-open`, `member-not-claimed`, `member-offline`, `no-bundle`, `bundle-not-head`,
-`bundle-final`, `bundle-incomplete`, `bundle-invalid`. Anything unexpected is a "no".
+either nothing has been proposed yet (`head` is `null`) or `bundle.state.nonce === head`, that state is not
+final, the bundle carries the arbiter's and every player's signature, **every signature verifies**, and the
+bundle is for this `tableId`, `domain` (and `roster`). The verifier is not optional: signatures that merely look
+complete (65 zero bytes) must not open the gate, and neither may a bundle that was legitimately signed for another
+table. Reasons, in the order they are checked: `bad-view` (including a missing `head`, `tableId` or `domain`),
+`no-verifier`, `not-active`, `round-open`, `member-not-claimed`, `member-offline`, `no-bundle`, `bundle-not-head`,
+`bundle-final`, `bundle-incomplete`, `bundle-wrong-table` (the bundle is valid but for another domain, table or
+roster), `bundle-invalid` (a signature fails). Anything unexpected is a "no".
 
 ### `ids.js`
 
 - `tableKeyFor({ chainId, vault, serverId, generation })` = `keccak256(utf8("pgg:" + chainId + ":" + vault + ":" + serverId + ":" + generation))`,
-  vault lowercase. `serverId` is a non-empty string without `:`.
+  vault lowercase. `serverId` is a non-empty, well-formed Unicode string without `:` (a lone surrogate would be
+  encoded as U+FFFD and collide with the real U+FFFD, so it is a `RangeError`).
 - `claimDigest({ domain, tableKey, address, playerId })` = `keccak256(utf8("PGG claim v1") || uint256(chainId) || vault (20 bytes) || tableKey (32 bytes) || address (20 bytes) || utf8(playerId))`.
 - `signClaim(sessionPrivateKey, claim)`, `recoverClaim(claim, signature) -> address | null`,
-  `verifyClaim(claim, signature, sessionKey) -> boolean`. A session-key proof of an on-chain seat; the server
-  checks it against `seats(tableKey, address).sessionKey`.
+  `verifyClaim(claim, signature, sessionKey) -> boolean` (`false` when `sessionKey` is not a string). A
+  session-key proof of an on-chain seat; the server checks it against `seats(tableKey, address).sessionKey`.
+  `playerId` must be well-formed Unicode too.
 
 ### `sign.js`
 
@@ -249,13 +331,14 @@ and the file identical and runs it).
 // test/readme.test.js checks that README.md contains this file's code and that it still runs.
 import {
   buildNextState,
+  bundleConflict,
   bundleFromWire,
   bundleToWire,
   canDeal,
   checkState,
   clientShouldSign,
   decideSign,
-  genesisState,
+  epochBaseline,
   hashState,
   isNewer,
   makeBundle,
@@ -289,10 +372,12 @@ export function main() {
     return seat ? privateKeyToAddress(seat.sessionKey) : null;
   };
 
-  // The epoch starts: each player deposited 1000 chips and 7 token units of dust.
+  // The epoch starts: each player deposited 1000 chips and 7 token units of dust. A brand-new table has
+  // nonce, rake and volume 0, written out; a rolled-over epoch passes the table's nonce and rakePaid and the
+  // cumulative volume of the final state that closed the last epoch (depositState is only for exit digests).
   const tableId = tableKeyFor({ chainId: 31337, vault, serverId: 'pgg-1', generation: 1 });
   const deposits = players.map(() => toTokenUnits(1000, unit) + 7n);
-  const genesis = genesisState({ tableId, players, deposits });
+  const genesis = epochBaseline({ tableId, players, deposits, nonce: 0n, rake: 0n, volume: 0n });
   const table = {
     nonce: genesis.nonce,
     escrow: deposits.reduce((a, b) => a + b, 0n),
@@ -329,6 +414,7 @@ export function main() {
     unit,
     maxRakeBps,
     baseline: genesis,
+    myBalance: deposits[sorted.indexOf(seat)], // my own deposit record, never the server's message
     last: null,
     intent: 'play',
     observed: { deltas, rake: 2, pot: 200 },
@@ -338,7 +424,8 @@ export function main() {
   const refused = clientShouldSign({ state: forged, domain }, view(sorted[0]));
 
   // The nonce record is written before the signature is sent; asking again for the same digest is a repeat.
-  const digest = hashState(state, domain);
+  // A yes carries the digest the client computed: that is the one to sign.
+  const digest = verdicts[0].digest;
   const decision = decideSign({ req: { nonce: state.nonce, digest }, last: null });
   const again = decideSign({
     req: { nonce: state.nonce, digest },
@@ -350,9 +437,14 @@ export function main() {
     domain,
     state,
     arbiterSig: signDigest(arbiterKey, digest),
-    playerSigs: sorted.map((seat) => signDigest(seat.sessionKey, digest)),
+    playerSigs: sorted.map((seat, i) => signDigest(seat.sessionKey, verdicts[i].digest)),
   });
-  const verified = verifyBundle(bundle, { arbiter, sessionKeyOf });
+  // The browser has no chain access, so it also says which chain, vault, table and roster it expects.
+  const verified = verifyBundle(bundle, {
+    arbiter,
+    sessionKeyOf,
+    expect: { domain, tableId, players },
+  });
   const contractView = checkState(state, bundle, ctx); // what startExit would do with it
 
   // Over the wire (JSON) and back, then the table may deal the next hand.
@@ -364,6 +456,9 @@ export function main() {
     head: state.nonce,
     bundle: received,
     members,
+    verify: { arbiter, sessionKeyOf }, // required: the gate checks every signature itself
+    tableId,
+    domain,
   });
 
   return {
@@ -375,6 +470,8 @@ export function main() {
     verified,
     contractView,
     newer: isNewer(received, null),
+    conflict: bundleConflict(received, bundle), // null: two bundles at one nonce would be an alarm
+    hashed: hashState(state, domain),
     mayDeal,
   };
 }
@@ -398,5 +495,9 @@ PATH=/opt/foundry:$PATH PGG_REQUIRE_CHAIN_TESTS=1 bun test packages/vault
   rolled-over epoch with rake already paid) must give the contract's first error with the same arguments, and
   the test fails if any ECDSA error or any `_verify` error is never reached. `chain/setup.js` is the shared
   set-up (one Active table of three players on anvil).
-- `rules.test.js`, `bundle.test.js`, `state.test.js`, `units.test.js`, `ids.test.js`, `build.test.js`, `abi.test.js`.
+- `rules.test.js`, `bundle.test.js`, `state.test.js`, `units.test.js`, `ids.test.js`, `build.test.js`, `abi.test.js`,
+  `rake-ceiling.test.js`.
+- `review-*.test.js`: the adversarial review of every module. A title starting with `REVIEW BUG` or `REVIEW GAP`
+  is a finding that has been fixed and is now a regression test; a `test.todo` is a finding that was left open on
+  purpose, with the reason in the first line of its body.
 - The seeded generators are in `test/gen.js`, a small world (keys, table row) in `test/fixtures.js`.

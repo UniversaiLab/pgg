@@ -19,6 +19,12 @@ import { decodeState, normalizeAddress, rosterHash } from './state.js';
 /** PokerVault.Status, as the contract's `tables(id).status` returns it. */
 export const STATUS = Object.freeze({ None: 0, Filling: 1, Active: 2, Exiting: 3, Closed: 4 });
 
+/**
+ * PokerVault.RAKE_BPS_CEILING: the constructor refuses a MAX_RAKE_BPS above it, so no vault caps rake
+ * higher. test/rake-ceiling.test.js compares this number with the contract source.
+ */
+export const RAKE_BPS_CEILING = 500;
+
 const ARBITER_INDEX = UINT256_MAX; // BadSignature(type(uint256).max) means the arbiter
 const ZERO_ADDRESS = `0x${'00'.repeat(20)}`;
 
@@ -238,7 +244,8 @@ function prepare(state, sigs, ctx, options) {
  *
  *   state  a State (types and ranges are checked, the rest is the contract's job)
  *   sigs   { arbiterSig, playerSigs } as hex, or null to skip the signature steps (before signing)
- *   ctx    { domain, maxRakeBps, sessionKeyOf(playerAddress) -> sessionKey | null,
+ *   ctx    { domain, maxRakeBps, sessionKeyOf(playerAddress) -> sessionKey | null  (called with LOWERCASE
+ *            addresses),
  *            table: { nonce, escrow, rakePaid, rosterHash, arbiter } }   (see tableFromChain)
  *
  * It does not look at the table's status: startExit needs Active, challenge needs Exiting and an open

@@ -12,13 +12,11 @@ const MAX_BUFFERED_BYTES = 1_000_000; // a consumer further behind than this is 
 const LOBBY_INTERVAL_MS = 1000;
 const NOT_VAULT = Object.freeze({ ok: false, code: ERR.NOT_VAULT_TABLE }); // claim/sig at a play table
 
-// What a claim or a sig costs the sender in rate-limit tokens (a ping, act or seed costs 1). The actor has
-// to recover an ECDSA signature for each of them, about 1.2 ms of CPU, against microseconds for anything
-// else, so at 1 token apiece one socket could burn about 24 ms of CPU per second at the default 20
-// tokens/s, and many sockets would add up. At 10 the same socket gets 2 a second (burst 4 of the default 40),
-// while a real client sends one claim per connect and one sig per hand, many seconds apart. Keep this
-// well under the bucket capacity (RATE_CAPACITY, default 40): a bucket smaller than the cost could never
-// afford a claim or a sig. All of the cost is charged in #onMessage; nothing else knows about it.
+// Rate-limit tokens a claim or a sig costs (a ping, act or seed costs 1). The actor recovers an ECDSA
+// signature for each, about 1.2 ms of CPU against microseconds for anything else. At 1 token apiece one
+// socket could spend about 24 ms of CPU a second (20 tokens/s refill); at 10 it gets 2 a second after a
+// burst of 4 (default capacity 40), while a real client sends one claim per connect and one sig per hand.
+// RATE_CAPACITY must stay above this, or no claim or sig could ever be afforded. Only #onMessage charges it.
 export const SIGNATURE_COST = 10;
 const COSTLY = new Set([CLIENT.CLAIM, CLIENT.SIGN]);
 

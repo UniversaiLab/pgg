@@ -8,6 +8,25 @@ export const UINT256_MAX = (1n << 256n) - 1n;
 const encoder = new TextEncoder();
 export const utf8 = (text) => encoder.encode(text);
 
+/**
+ * True when `text` has no lone surrogate. TextEncoder turns each one into U+FFFD, so two different strings
+ * would hash alike; ids that are hashed must be well formed. (String.prototype.isWellFormed is too new for
+ * every browser we support, so this walks the code units.)
+ */
+export function isWellFormed(text) {
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      i++;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** keccak256 of bytes, as a '0x' + 64 hex string. */
 export const keccakHex = (bytes) => toHex(keccak256(bytes));
 

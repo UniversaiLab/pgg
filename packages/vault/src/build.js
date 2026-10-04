@@ -1,6 +1,7 @@
 // Building States. The server builds every state it proposes; clients and the watchtower build the deposit
-// state to compare against. Nothing here checks the money: run checkState on the result before it is
-// proposed, because that is the check that knows the table's escrow.
+// state (for an exit) or the epoch baseline (for the next hand) to compare against. Nothing here checks the
+// money: run checkState on the result before it is proposed, because that is the check that knows the
+// table's escrow.
 import { compareAddress, normalizeAddress, normalizeState } from './state.js';
 
 const allFalse = (n) => Array.from({ length: n }, () => false);
@@ -11,14 +12,11 @@ const amount = (value, field) => {
   throw new RangeError(`${field} must be a bigint`);
 };
 
-/**
- * The state a table starts an epoch from, the same one PokerVault builds in `depositState` for
- * `startExitFromDeposits`: each player's balance is their deposit, nothing is final or kept, volume is 0.
- * `nonce` and `rake` are the table's current `nonce` and `rakePaid` (0 for a new table). `players` must
- * already be the roster, strictly ascending, with `deposits[i]` belonging to `players[i]`.
- */
-export function genesisState({ tableId, players, deposits, nonce = 0n, rake = 0n }) {
+// One builder behind the three public names below. They differ only in which of nonce, rake and volume
+// the caller must say out loud, because a silent default is how a rolled-over epoch lost its volume.
+function baselineState({ tableId, players, deposits, nonce, rake, volume }) {
   if (!Array.isArray(deposits)) throw new RangeError('deposits must be an array');
+  if (!Array.isArray(players)) throw new RangeError('players must be an array');
   return normalizeState({
     tableId,
     nonce: amount(nonce, 'nonce'),
@@ -27,8 +25,54 @@ export function genesisState({ tableId, players, deposits, nonce = 0n, rake = 0n
     balances: deposits.map((d, i) => amount(d, `deposits[${i}]`)),
     keep: allFalse(players.length),
     rake: amount(rake, 'rake'),
-    volume: 0n,
+    volume: amount(volume, 'volume'),
   });
+}
+
+/**
+ * The synthetic state `startExitFromDeposits` puts up, exactly as PokerVault builds it in `depositState`:
+ * each player's balance is their deposit, nothing is final or kept, `nonce` and `rake` are the table's
+ * current `nonce` and `rakePaid` (0 for a new table), and **volume is always 0**: the contract does not
+ * store volume, so the exit digest has none. Use this to compare against, or finalise, an exit from
+ * deposits. It is NOT the baseline for playing the next hand of a rolled-over epoch: that is epochBaseline.
+ * `players` must already be the roster, strictly ascending, with `deposits[i]` belonging to `players[i]`.
+ */
+export function depositState({ tableId, players, deposits, nonce = 0n, rake = 0n, ...rest }) {
+  if ('volume' in rest) throw new RangeError('depositState has no volume: it is always 0');
+  return baselineState({ tableId, players, deposits, nonce, rake, volume: 0n });
+}
+
+/**
+ * The state the FIRST hand of an epoch is built on, and the baseline a client checks it against. Rake and
+ * volume are cumulative since the table was created, so after a rollover this carries both: `nonce` and
+ * `rake` are the table's `nonce` and `rakePaid`, and `volume` is the volume of the final state that closed
+ * the previous epoch. The vault does not store volume, so take it from the final bundle you hold (server
+ * and clients keep it durably), never from a message the other side sends you. Leave it at 0 and the next
+ * hand at 2% of its own pot is RakeTooHigh against the cumulative cap. `deposits[i]` is the balance of
+ * `players[i]` (a stayer's balance from the final state, a new player's deposit). All three of nonce, rake
+ * and volume are required, on purpose: 0n for a brand-new table, written out.
+ */
+export function epochBaseline({ tableId, players, deposits, nonce, rake, volume }) {
+  for (const [name, value] of [
+    ['nonce', nonce],
+    ['rake', rake],
+    ['volume', volume],
+  ]) {
+    if (value === undefined) {
+      throw new RangeError(
+        `${name} is required (cumulative since the table was created; 0n if new)`,
+      );
+    }
+  }
+  return baselineState({ tableId, players, deposits, nonce, rake, volume });
+}
+
+/**
+ * The general form of the two above, kept so existing callers work: `volume` is optional and defaults to
+ * 0n. Prefer depositState (exit digests) or epochBaseline (playing on): they say which one you mean.
+ */
+export function genesisState({ tableId, players, deposits, nonce = 0n, rake = 0n, volume = 0n }) {
+  return baselineState({ tableId, players, deposits, nonce, rake, volume });
 }
 
 /**
@@ -53,6 +97,7 @@ export function buildNextState({
   if (final && keep !== undefined && (!Array.isArray(keep) || keep.length !== n)) {
     throw new RangeError('keep must have one entry per player');
   }
+  if (typeof final !== 'boolean') throw new RangeError('final must be a boolean');
   const rakeStep = amount(rakeDelta, 'rakeDelta');
   const volumeStep = amount(volumeDelta, 'volumeDelta');
   if (rakeStep < 0n) throw new RangeError('rakeDelta must not be negative');
@@ -60,7 +105,7 @@ export function buildNextState({
   return normalizeState({
     tableId: p.tableId,
     nonce: p.nonce + 1n,
-    isFinal: Boolean(final),
+    isFinal: final,
     players: p.players,
     balances: balances.map((b, i) => amount(b, `balances[${i}]`)),
     keep: final && keep ? keep : allFalse(n),

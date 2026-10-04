@@ -36,6 +36,7 @@ export class Bot {
     this.rng = seed;
     this.log = [];
     this.invalid = [];
+    this.hookErrors = []; // what onMessageHook threw: { msg, error }
     this.state = null;
     this.hole = new Map(); // handNo -> [card, card]
     this.proofs = [];
@@ -117,12 +118,12 @@ export class Bot {
   }
 
   #onMessage(msg) {
-    this.onMessageHook?.(msg);
     this.log.push(msg);
     if (this.validate) {
       const parsed = ServerMessage.safeParse(msg);
       if (!parsed.success) this.invalid.push({ msg, issues: parsed.error.issues });
     }
+    this.#runHook(msg);
     switch (msg.t) {
       case SERVER.WELCOME:
         this.balance = msg.player.balance;
@@ -160,6 +161,20 @@ export class Bot {
       case SERVER.TABLE:
         this.#onTable(msg);
         break;
+    }
+  }
+
+  // A hook sees a message only after it is logged and validated, and what it throws (or rejects with) is
+  // kept in `hookErrors` instead of escaping: a faulty hook must never cost the log a message, skip its
+  // schema check or leave the bot's own state out of date.
+  #runHook(msg) {
+    if (!this.onMessageHook) return;
+    const failed = (error) => this.hookErrors.push({ msg, error });
+    try {
+      const result = this.onMessageHook(msg);
+      if (typeof result?.catch === 'function') result.catch(failed); // an async hook
+    } catch (error) {
+      failed(error);
     }
   }
 

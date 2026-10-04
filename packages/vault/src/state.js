@@ -62,6 +62,22 @@ function uint(value, bits, field) {
 
 function list(value, field) {
   if (!Array.isArray(value)) throw new RangeError(`${field} must be an array`);
+  // map() and every() skip holes, so a hole would sail through the per-element checks and stay a hole
+  for (let i = 0; i < value.length; i++) {
+    if (!(i in value)) throw new RangeError(`${field}[${i}] is missing (sparse array)`);
+  }
+  return value;
+}
+
+const PLAYERS_RANGE = `players must have ${MIN_PLAYERS} to ${MAX_PLAYERS} entries`;
+const ONE_PER_PLAYER = (field) => `${field} must have one entry per player`;
+
+/**
+ * Refuse an array longer than any table can have BEFORE anything walks it: a hostile peer can send
+ * millions of entries, and every later check (hole scan, per-element parsing) is linear in the length.
+ */
+function notTooLong(value, message) {
+  if (Array.isArray(value) && value.length > MAX_PLAYERS) throw new RangeError(message);
   return value;
 }
 
@@ -71,6 +87,11 @@ function parse(raw, strict) {
     throw new RangeError('tableId must be 32 bytes of 0x hex');
   }
   if (typeof raw.isFinal !== 'boolean') throw new RangeError('isFinal must be a boolean');
+  if (strict) {
+    notTooLong(raw.players, PLAYERS_RANGE);
+    notTooLong(raw.balances, ONE_PER_PLAYER('balances'));
+    notTooLong(raw.keep, ONE_PER_PLAYER('keep'));
+  }
   const state = {
     tableId: raw.tableId.toLowerCase(),
     nonce: uint(raw.nonce, 64, 'nonce'),
@@ -88,10 +109,10 @@ function parse(raw, strict) {
 
   const n = state.players.length;
   if (n < MIN_PLAYERS || n > MAX_PLAYERS) {
-    throw new RangeError(`players must have ${MIN_PLAYERS} to ${MAX_PLAYERS} entries`);
+    throw new RangeError(PLAYERS_RANGE);
   }
-  if (state.balances.length !== n) throw new RangeError('balances must have one entry per player');
-  if (state.keep.length !== n) throw new RangeError('keep must have one entry per player');
+  if (state.balances.length !== n) throw new RangeError(ONE_PER_PLAYER('balances'));
+  if (state.keep.length !== n) throw new RangeError(ONE_PER_PLAYER('keep'));
   if (BigInt(state.players[0]) === 0n)
     throw new RangeError('players[0] must not be the zero address');
   for (let i = 1; i < n; i++) {
@@ -147,6 +168,10 @@ function decimal(value, field) {
  */
 export function fromWire(wire) {
   if (wire === null || typeof wire !== 'object') throw new RangeError('state must be an object');
+  // the lengths are checked before any element is converted, so a huge array costs one comparison
+  notTooLong(wire.players, PLAYERS_RANGE);
+  notTooLong(wire.balances, ONE_PER_PLAYER('balances'));
+  notTooLong(wire.keep, ONE_PER_PLAYER('keep'));
   return normalizeState({
     tableId: wire.tableId,
     nonce: decimal(wire.nonce, 'nonce'),
@@ -159,8 +184,15 @@ export function fromWire(wire) {
   });
 }
 
-const sameList = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
-const lower = (list) => list.map((item) => item.toLowerCase());
+// A hole is never equal to anything (Array.prototype.every would skip it), so walk the indexes.
+function sameList(a, b, same = (x, y) => x === y) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!(i in a) || !(i in b) || !same(a[i], b[i])) return false;
+  }
+  return true;
+}
+const sameAddress = (x, y) => x.toLowerCase() === y.toLowerCase();
 
 /** Field-for-field equality of two internal States. Never throws; anything that is not a State is false. */
 export function statesEqual(a, b) {
@@ -169,7 +201,7 @@ export function statesEqual(a, b) {
       a.tableId.toLowerCase() === b.tableId.toLowerCase() &&
       a.nonce === b.nonce &&
       a.isFinal === b.isFinal &&
-      sameList(lower(a.players), lower(b.players)) &&
+      sameList(a.players, b.players, sameAddress) &&
       sameList(a.balances, b.balances) &&
       sameList(a.keep, b.keep) &&
       a.rake === b.rake &&

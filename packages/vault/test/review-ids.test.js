@@ -2,7 +2,8 @@
 // claims share a key or a digest, does the case of an address matter, and is a claim signature bound to
 // everything it says.
 //
-// `test.todo` bodies are findings written as executable specs (`bun test --todo` runs them).
+// `test.todo` bodies are findings written as executable specs (`bun test --todo` runs them); the ones that
+// were fixed are ordinary tests now.
 import { describe, expect, test } from 'bun:test';
 import { concat, keccak256, toHex } from 'viem';
 import { hashState } from '../src/eip712.js';
@@ -113,7 +114,7 @@ describe('tableKeyFor', () => {
       expect(() => key({ vault })).toThrow(RangeError);
   });
 
-  test.todo('REVIEW GAP (nit): two serverIds that differ only in lone surrogates must not share a key', () => {
+  test('REVIEW GAP (nit): two serverIds that differ only in lone surrogates must not share a key', () => {
     // TextEncoder replaces a lone surrogate with U+FFFD, so '\ud800', '\ud801' and '�' all hash to the
     // same bytes and therefore the same on-chain table id. A serverId is operator configuration, so this is
     // not exploitable by a player, but a canonicalisation hole in an id is cheap to close (isWellFormed()).
@@ -126,6 +127,14 @@ describe('tableKeyFor', () => {
       }
     });
     expect(new Set(keys).size).toBe(ids.length);
+    // the fix refuses the ill-formed ones (a RangeError naming the field) and still accepts well-formed ones
+    for (const serverId of ['\ud800', '\udc00', 'a\ud800b', '\udc00\ud800', '\ud800\ud800']) {
+      expect(() => key({ serverId }), JSON.stringify(serverId)).toThrow(
+        /serverId must be well-formed/,
+      );
+    }
+    expect(key({ serverId: '\ud83c\udccf' })).toMatch(/^0x[0-9a-f]{64}$/); // a surrogate PAIR is fine
+    expect(key({ serverId: '�' })).toMatch(/^0x[0-9a-f]{64}$/);
   });
 });
 
@@ -247,10 +256,21 @@ describe('claimDigest', () => {
     expect(claimDigest(claim({ playerId: 'x'.repeat(1_000_000) }))).toMatch(/^0x[0-9a-f]{64}$/);
   });
 
-  test.todo('REVIEW GAP (nit): two player ids that differ only in lone surrogates must not share a digest', () => {
-    const a = claimDigest(claim({ playerId: 'p\ud800' }));
-    const b = claimDigest(claim({ playerId: 'p�' }));
-    expect(a).not.toBe(b);
+  test('REVIEW GAP (nit): two player ids that differ only in lone surrogates must not share a digest', () => {
+    // a lone surrogate used to collapse to U+FFFD and collide with the real U+FFFD; now it is refused
+    expect(() => claimDigest(claim({ playerId: 'p\ud800' }))).toThrow(
+      /playerId must be well-formed/,
+    );
+    expect(() => claimDigest(claim({ playerId: '\udc00p' }))).toThrow(RangeError);
+    expect(claimDigest(claim({ playerId: 'p�' }))).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(claimDigest(claim({ playerId: 'p\ud83c\udccf' }))).not.toBe(
+      claimDigest(claim({ playerId: 'p�' })),
+    );
+    // nothing signs or verifies a claim whose id is ill formed either
+    expect(() => signClaim(SESSION, claim({ playerId: 'p\ud800' }))).toThrow(RangeError);
+    expect(() => recoverClaim(claim({ playerId: 'p\ud800' }), `0x${'11'.repeat(65)}`)).toThrow(
+      RangeError,
+    );
   });
 });
 
@@ -321,8 +341,12 @@ describe('signClaim, recoverClaim, verifyClaim', () => {
     expect(signClaim(SESSION, claim())).toBe(sig);
   });
 
-  test.todo('REVIEW GAP (nit): verifyClaim with a session key that is not a string answers false instead of throwing', () => {
+  test('REVIEW GAP (nit): verifyClaim with a session key that is not a string answers false instead of throwing', () => {
     expect(verifyClaim(claim(), sig, 12345)).toBe(false);
+    for (const junk of [undefined, null, 5n, {}, [], true, Symbol('k'), () => SESSION_ADDRESS]) {
+      expect(verifyClaim(claim(), sig, junk), String(typeof junk)).toBe(false);
+    }
+    expect(verifyClaim(claim(), sig, SESSION_ADDRESS)).toBe(true);
   });
 
   test('replay: nothing in a claim is fresh, so a captured claim verifies again (identity only, never funds)', () => {

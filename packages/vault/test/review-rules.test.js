@@ -5,11 +5,13 @@
 // (for example "other players' balances moved but mine did not") says so in the test title and is justified
 // against docs/trust-model.md in the comment above it.
 //
-// Titles starting with "REVIEW BUG" fail on purpose today (see the report); `test.todo` bodies are design gaps
-// written as executable specs: run them with `bun test --todo` to see what they would assert.
+// Titles starting with "REVIEW BUG" or "REVIEW GAP" are findings that have been fixed; they stay as regression
+// tests. A `test.todo` body is a finding left open on purpose, with the reason on its first line: run them with
+// `bun test --todo` to see what they would assert.
 import { describe, expect, test } from 'bun:test';
 import { buildNextState, genesisState } from '../src/build.js';
 import { makeBundle, verifyBundle } from '../src/bundle.js';
+import { RAKE_BPS_CEILING } from '../src/check.js';
 import { hashState } from '../src/eip712.js';
 import {
   canDeal,
@@ -29,11 +31,16 @@ const seen = { deltas: [98, -100, 0], rake: 2, pot: 200 }; // seat 0 beats me (s
 const HAND = { winner: 0, loser: 1, amount: 100n * UNIT, rake: 2n * UNIT, pot: 200n * UNIT };
 const hand = w.nextHand(base, HAND); // nonce 1
 const digestOf = (state, domain = w.domain) => hashState(state, domain);
+// the durable record of a state I signed: it carries the state itself, because when it is ahead of the
+// all-signed baseline the money is judged against it
 const record = (state, isFinal = false) => ({
   nonce: state.nonce,
   digest: digestOf(state),
   isFinal,
+  state,
 });
+// a yes hands back the digest the client computed, so the caller signs that and nothing else
+const yes = (state) => ({ ok: true, digest: digestOf(state) });
 const view = (over = {}) => ({
   me: w.players[ME],
   domain: w.domain,
@@ -59,7 +66,7 @@ const shift = (state, from, to, amount) =>
 
 describe('control: the honest request is signed', () => {
   test('so every refusal below is the hostile part and nothing else', () => {
-    expect(verdict(hand)).toEqual({ ok: true });
+    expect(verdict(hand)).toEqual(yes(hand));
   });
 });
 
@@ -99,11 +106,11 @@ describe('a lower nonce, a same nonce, a replay', () => {
   });
 
   test('a replay of the request I already signed gets the same yes, so the same signature can be resent', () => {
-    expect(verdict(hand, { last: record(hand) })).toEqual({ ok: true });
+    expect(verdict(hand, { last: record(hand) })).toEqual(yes(hand));
     // the replay is answered even when everything I know has moved on
-    expect(verdict(hand, { last: record(hand), baseline: hand, observed: null })).toEqual({
-      ok: true,
-    });
+    expect(verdict(hand, { last: record(hand), baseline: hand, observed: null })).toEqual(
+      yes(hand),
+    );
   });
 
   test('a replay of an OLDER request than the last one I signed is refused', () => {
@@ -207,7 +214,7 @@ describe('a state after a final, and a final that is not mine to sign (C2)', () 
       refusedBy('C1a'),
     );
     expect(verdict(final, { last: record(final, true), observed: null, intent: 'rotate' })).toEqual(
-      { ok: true },
+      yes(final),
     );
   });
 
@@ -220,7 +227,7 @@ describe('a state after a final, and a final that is not mine to sign (C2)', () 
       final: true,
       keep: [true, false, true],
     });
-    expect(verdict(leaves, { observed: null, intent: 'leave' })).toEqual({ ok: true });
+    expect(verdict(leaves, { observed: null, intent: 'leave' })).toEqual(yes(leaves));
   });
 
   test('a final state that keeps a seat with nothing left is refused here, because settle would revert (BadKeep)', () => {
@@ -245,7 +252,7 @@ describe('a state after a final, and a final that is not mine to sign (C2)', () 
       keep: [true, true, false],
     });
     expect(verdict(releasesEmpty, { baseline: drained, observed: null, intent: 'rotate' })).toEqual(
-      { ok: true },
+      yes(releasesEmpty),
     );
   });
 
@@ -258,7 +265,7 @@ describe('a state after a final, and a final that is not mine to sign (C2)', () 
       final: true,
       keep: [true, false, true],
     });
-    expect(verdict(finalHand, { intent: 'leave' })).toEqual({ ok: true });
+    expect(verdict(finalHand, { intent: 'leave' })).toEqual(yes(finalHand));
     const stolen = {
       ...finalHand,
       balances: finalHand.balances.map((b, i) => (i === ME ? b - UNIT : i === 0 ? b + UNIT : b)),
@@ -268,9 +275,9 @@ describe('a state after a final, and a final that is not mine to sign (C2)', () 
 
   test('a final state from a previous epoch must not be left in the record: the new epoch seeds it as not final', () => {
     // README: "On a new epoch store { nonce: settledNonce, digest, isFinal: false }"
-    expect(verdict(hand, { last: { nonce: 0n, digest: digestOf(base), isFinal: false } })).toEqual({
-      ok: true,
-    });
+    expect(verdict(hand, { last: { nonce: 0n, digest: digestOf(base), isFinal: false } })).toEqual(
+      yes(hand),
+    );
     expect(verdict(hand, { last: { nonce: 0n, digest: digestOf(base), isFinal: true } })).toEqual(
       refusedBy('C2'),
     );
@@ -383,9 +390,9 @@ describe('who gets paid: the balances of the seats (C1b, C1c)', () => {
       rake: 5n * UNIT,
       pot: 100n * UNIT,
     });
-    expect(verdict(atCap, { observed: { deltas: [45, -50, 0], rake: 5, pot: 100 } })).toEqual({
-      ok: true,
-    });
+    expect(verdict(atCap, { observed: { deltas: [45, -50, 0], rake: 5, pot: 100 } })).toEqual(
+      yes(atCap),
+    );
   });
 });
 
@@ -452,15 +459,15 @@ describe('the table, the roster and the domain are the pinned ones (C1d)', () =>
       chainId: w.domain.chainId,
       verifyingContract: w.domain.verifyingContract.toUpperCase().replace('0X', '0x'),
     };
-    expect(verdict(hand, {}, { domain: shouting })).toEqual({ ok: true });
+    expect(verdict(hand, {}, { domain: shouting })).toEqual(yes(hand));
     expect(verdict(hand, {}, { digest: digestOf(hand).toUpperCase().replace('0X', '0x') })).toEqual(
-      { ok: true },
+      yes(hand),
     );
   });
 
   test('the client signs the digest it computed itself, which differs from the request’s only if the server lied', () => {
     // with no `digest` in the request nothing can be compared, and the answer is still about the pinned domain
-    expect(clientShouldSign({ state: hand }, view())).toEqual({ ok: true });
+    expect(clientShouldSign({ state: hand }, view())).toEqual(yes(hand));
     const wrongDomainView = view({
       domain: { chainId: 1, verifyingContract: w.domain.verifyingContract },
     });
@@ -586,7 +593,7 @@ describe('requests that are not States, and views that are not usable', () => {
     const r = deepFreeze(req(hand));
     const v = deepFreeze(view());
     const before = JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x));
-    expect(clientShouldSign(r, v)).toEqual({ ok: true });
+    expect(clientShouldSign(r, v)).toEqual(yes(hand));
     expect(JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x))).toBe(before);
   });
 });
@@ -596,53 +603,150 @@ describe('what an honest client would still sign: design questions, decided', ()
   // counts chips. Dust (the remainder of a deposit) never moves, and C1b makes a one-unit transfer a refusal.
   test('dust rides along: a balance that is not a multiple of the unit is fine while it does not change', () => {
     expect(hand.balances[ME] % UNIT).toBe(base.balances[ME] % UNIT);
-    expect(verdict(hand)).toEqual({ ok: true });
+    expect(verdict(hand)).toEqual(yes(hand));
   });
 
   test('a pure nonce bump (same balances) is signed when nothing happened at the table', () => {
     const bump = { ...base, nonce: 1n };
-    expect(verdict(bump, { observed: null })).toEqual({ ok: true });
+    expect(verdict(bump, { observed: null })).toEqual(yes(bump));
   });
 
-  test('the rewind IS caught when the ledger reports every hand since the baseline (observed is cumulative)', () => {
+  test('the rewind of a hand I signed is caught whatever the ledger reports (the money is judged against the state I signed)', () => {
     // I signed the state after hand 1 (nonce 1); it is not all-signed yet, so the baseline is still the
     // genesis. The server now asks for nonce 2 with the genesis balances, as if hand 1 never happened.
+    // `last` carries the state I signed, and `observed` is what happened since THAT state.
     const rewind = { ...base, nonce: 2n };
-    const r = verdict(rewind, { last: record(hand), observed: seen });
+    for (const observed of [seen, null, { deltas: [0, 0, 0], rake: 0, pot: 0 }]) {
+      const r = verdict(rewind, { last: record(hand), observed });
+      expect(r, JSON.stringify(observed)).toEqual(refusedBy('C1e')); // hand 1 took rake, and the rewind gives it back
+      expect(r.detail).toMatch(/rake/);
+    }
+    // a hand without rake leaves nothing but the balances to catch it: the seat that won is rewound
+    const quiet = w.nextHand(base, { ...HAND, rake: 0n });
+    const quietRewind = { ...base, nonce: 2n, volume: quiet.volume };
+    const r = verdict(quietRewind, { last: record(quiet), observed: null });
     expect(r).toEqual(refusedBy('C1b'));
     expect(r.detail).toMatch(/player 0/);
   });
 
-  test.todo('REVIEW GAP: the rewind must also be caught when `observed` only describes the latest hand (trust-model rule 1: "extends the last state you signed")', () => {
-    // `last` is { nonce, digest, isFinal }: it has no balances, so the library cannot tell that this
-    // request throws away a hand I already signed. Safe only if the caller's ledger reports ALL hands since
-    // the baseline. Either document `observed` as cumulative since `baseline` (the README says "the hand I
-    // watched"), or let `last` carry the signed state and take the higher of baseline and last as the base.
-    const rewind = { ...base, nonce: 2n };
-    const r = verdict(rewind, { last: record(hand), observed: null });
-    expect(r.ok).toBe(false);
+  test('the next hand is built on the state I signed, with the observed hand applied on top of it', () => {
+    const second = w.nextHand(hand, {
+      winner: 2,
+      loser: 0,
+      amount: 10n * UNIT,
+      rake: 0n,
+      pot: 20n * UNIT,
+    });
+    const afterSecond = { deltas: [-10, 0, 10], rake: 0, pot: 20 };
+    // hand 1 is signed but not all-signed (baseline still the genesis): only hand 2 is "observed"
+    expect(verdict(second, { last: record(hand), observed: afterSecond })).toEqual(yes(second));
+    // reporting both hands as if they were measured from the genesis double counts hand 1: refused
+    const both = { deltas: [88, -100, 10], rake: 2, pot: 220 };
+    expect(verdict(second, { last: record(hand), observed: both })).toEqual(refusedBy('C1b'));
   });
 
-  test.todo('REVIEW GAP: a request that extends a FINAL baseline is refused (baseline.isFinal is a view error)', () => {
+  test('a record ahead of the baseline must carry its state, or the money cannot be checked: VIEW', () => {
+    const bare = { nonce: hand.nonce, digest: digestOf(hand), isFinal: false };
+    const second = w.nextHand(hand);
+    expect(verdict(second, { last: bare, observed: null })).toEqual(refusedBy('VIEW'));
+    // the nonce refusals do not need money and still say what they are
+    expect(verdict(hand, { last: { ...bare, nonce: 5n } })).toEqual(refusedBy('C1a'));
+    // a record that is not ahead needs no state (a new epoch seeds { nonce: settledNonce, digest })
+    expect(verdict(hand, { last: { nonce: 0n, digest: digestOf(base), isFinal: false } })).toEqual(
+      yes(hand),
+    );
+  });
+
+  test('a record whose state contradicts it is a view error, not something to build on', () => {
+    const second = w.nextHand(hand);
+    const other = w.nextHand(base, { ...HAND, amount: 50n * UNIT });
+    const records = {
+      'state of another nonce': { ...record(hand), state: other.nonce === 1n ? second : other },
+      'state that does not hash to the digest': { ...record(hand), state: other },
+      'isFinal disagrees': { ...record(hand), isFinal: true },
+      'state of another table': {
+        ...record(hand),
+        state: { ...hand, tableId: `0x${'ab'.repeat(32)}` },
+      },
+      'state that is not a State': { ...record(hand), state: { nonce: 1n } },
+    };
+    for (const [name, last] of Object.entries(records)) {
+      expect(verdict(second, { last, observed: null }), name).toEqual(refusedBy('VIEW'));
+    }
+  });
+
+  test('REVIEW GAP: a request that extends a FINAL baseline is refused (baseline.isFinal is a view error)', () => {
     const final = buildNextState({ prev: base, balances: base.balances, final: true });
     const after = { ...final, nonce: 2n, isFinal: false };
-    expect(verdict(after, { baseline: final, observed: null }).ok).toBe(false);
+    const r = verdict(after, { baseline: final, observed: null });
+    expect(r).toEqual(refusedBy('C2'));
+    expect(r.detail).toMatch(/final/);
+    // a final after a final, and a final that follows a final signed in this epoch, are no different
+    expect(
+      verdict({ ...final, nonce: 2n }, { baseline: final, observed: null, intent: 'rotate' }),
+    ).toEqual(refusedBy('C2'));
+    expect(verdict(after, { baseline: base, last: record(final, true), observed: null })).toEqual(
+      refusedBy('C2'),
+    );
   });
 
-  test.todo('REVIEW GAP: a nonce that jumps by 2^64-1 burns the whole nonce space with one honest signature', () => {
+  test('REVIEW GAP: a nonce that jumps by 2^64-1 burns the whole nonce space with one honest signature', () => {
     // The state is otherwise correct (same balances), so nobody loses money, but no state can ever follow it
-    // and no later state can ever challenge an exit from it. The arbiter may legitimately skip a few nonces
-    // (a crash after reserve), so the bound has to be generous, but 2^64 - 1 is not a recovery gap.
-    expect(verdict({ ...base, nonce: UINT64_MAX }, { observed: null }).ok).toBe(false);
+    // and no later state can ever challenge an exit from it. An honest server steps by one.
+    const r = verdict({ ...base, nonce: UINT64_MAX }, { observed: null });
+    expect(r).toEqual(refusedBy('C1a'));
+    expect(r.detail).toMatch(/skips ahead/);
   });
 
-  test.todo('REVIEW GAP: a non-final state must carry keep all false (the contract reads keep only in settle)', () => {
+  test('the nonce must be exactly the next one, counted from the newest state I hold', () => {
+    const skip = { ...hand, nonce: 2n };
+    expect(verdict(skip)).toEqual(refusedBy('C1a'));
+    // counted from the baseline when I signed nothing newer, from my record when I did
+    const second = w.nextHand(hand, { amount: 0n, rake: 0n, pot: 0n });
+    const third = { ...second, nonce: 3n };
+    expect(verdict(second, { last: record(hand), observed: null })).toEqual(yes(second));
+    expect(verdict(third, { last: record(hand), observed: null })).toEqual(refusedBy('C1a'));
+    expect(verdict(third, { baseline: hand, observed: null })).toEqual(refusedBy('C1a'));
+  });
+
+  test('the allowed gap is an option: maxNonceGap widens it, the money is still checked, bad values are VIEW', () => {
+    const skip = { ...hand, nonce: 3n };
+    expect(verdict(skip, { maxNonceGap: 3 })).toEqual(yes(skip));
+    expect(verdict(skip, { maxNonceGap: 3n })).toEqual(yes(skip));
+    expect(verdict(skip, { maxNonceGap: 2 })).toEqual(refusedBy('C1a'));
+    expect(verdict({ ...skip, nonce: 4n }, { maxNonceGap: 3 })).toEqual(refusedBy('C1a'));
+    expect(verdict({ ...skip, volume: skip.volume + UNIT }, { maxNonceGap: 3 })).toEqual(
+      refusedBy('C1b'),
+    );
+    for (const maxNonceGap of [0, 0n, -1, 1.5, '2', null, Number.NaN]) {
+      expect(verdict(hand, { maxNonceGap }), String(maxNonceGap)).toEqual(refusedBy('VIEW'));
+    }
+  });
+
+  test('REVIEW GAP: a non-final state must carry keep all false (the contract reads keep only in settle)', () => {
     // keep flags in a non-final state are signed bytes with no meaning: they let the server mint many digests
     // for one economic state (state malleability), and `_depositState` / buildNextState never produce them.
-    expect(verdict({ ...hand, keep: [true, false, true] }).ok).toBe(false);
+    const r = verdict({ ...hand, keep: [true, false, true] });
+    expect(r).toEqual(refusedBy('C2'));
+    expect(r.detail).toMatch(/keep/);
+    for (const keep of [
+      [true, true, true],
+      [false, true, false],
+      [false, false, true],
+    ]) {
+      expect(verdict({ ...hand, keep }), String(keep)).toEqual(refusedBy('C2'));
+    }
+    // a final state is where keep belongs
+    const final = buildNextState({
+      prev: base,
+      balances: base.balances,
+      final: true,
+      keep: [true, true, true],
+    });
+    expect(verdict(final, { observed: null, intent: 'rotate' })).toEqual(yes(final));
   });
 
-  test.todo('REVIEW GAP: observed.rake and observed.pot must not be negative', () => {
+  test('REVIEW GAP: observed.rake and observed.pot must not be negative', () => {
     // A negative pot lets the volume go DOWN. The contract allows it (it only tightens the cap), but no
     // hand has a negative pot: it can only come from a broken ledger, and fail-closed is the library's rule.
     const withVolume = { ...base, volume: 5n * UNIT };
@@ -650,15 +754,39 @@ describe('what an honest client would still sign: design questions, decided', ()
       req({ ...base, nonce: 1n, volume: 0n }),
       view({ baseline: withVolume, observed: { deltas: [0, 0, 0], rake: 0, pot: -5 } }),
     );
-    expect(r.ok).toBe(false);
+    expect(r).toEqual(refusedBy('VIEW'));
+    expect(r.detail).toMatch(/negative/);
+    // a negative rake is the same, unless the state itself already broke the rake rule first (C1e)
+    const richBase = { ...base, rake: 3n * UNIT, volume: 100n * UNIT };
+    const back = {
+      ...richBase,
+      nonce: 1n,
+      balances: richBase.balances.map((b, i) => (i === 0 ? b + 3n * UNIT : b)),
+      rake: 0n,
+    };
+    expect(
+      clientShouldSign(
+        req(back),
+        view({
+          baseline: {
+            ...richBase,
+            balances: richBase.balances.map((b, i) => (i === 0 ? b - 3n * UNIT : b)),
+          },
+          observed: { deltas: [3, 0, 0], rake: -3, pot: 0 },
+        }),
+      ),
+    ).toEqual(refusedBy('C1e'));
   });
 
-  test.todo('REVIEW GAP: maxRakeBps above the contract’s own ceiling (500) is a view error', () => {
+  test('REVIEW GAP: maxRakeBps above the contract’s own ceiling (500) is a view error', () => {
     // The vault constructor rejects maxRakeBps_ > 500, so a view claiming more is not read from a vault.
-    expect(clientShouldSign(req(hand), view({ maxRakeBps: 10_000 })).ok).toBe(false);
+    expect(clientShouldSign(req(hand), view({ maxRakeBps: 10_000 }))).toEqual(refusedBy('VIEW'));
+    expect(clientShouldSign(req(hand), view({ maxRakeBps: 501 }))).toEqual(refusedBy('VIEW'));
+    expect(clientShouldSign(req(hand), view({ maxRakeBps: RAKE_BPS_CEILING }))).toEqual(yes(hand));
   });
 
   test.todo('REVIEW GAP: intent "rotate" should require keep[me] to match "my balance is above zero"', () => {
+    // NOT FIXED ON PURPOSE: drain, idle and maintenance rotations legitimately pay a seat out; needs a rotation reason in the view.
     // Today a rotation may pay me out and remove me from the table (keep[me] false) although I never asked
     // to leave. No funds are lost (the payout goes to my own wallet), but it is an eviction on the server's say-so.
     const evict = buildNextState({
@@ -670,9 +798,41 @@ describe('what an honest client would still sign: design questions, decided', ()
     expect(verdict(evict, { observed: null, intent: 'rotate' }).ok).toBe(false);
   });
 
-  test.todo('REVIEW GAP: a yes should hand back the digest to sign, so the caller never signs the server’s copy', () => {
+  test('REVIEW GAP: a yes should hand back the digest to sign, so the caller never signs the server’s copy', () => {
     const r = verdict(hand);
     expect(r.digest).toBe(digestOf(hand));
+    // with nothing but the state in the request the digest is the same, computed under the pinned domain
+    expect(clientShouldSign({ state: hand }, view()).digest).toBe(digestOf(hand));
+    // a request that names a different digest is a refusal, not a yes with a different digest
+    const lie = verdict(hand, {}, { digest: digestOf(w.nextHand(hand)) });
+    expect(lie).toEqual(refusedBy('C1d'));
+    expect(lie.digest).toBeUndefined();
+    // a repeat of a state I signed hands back the same digest
+    expect(verdict(hand, { last: record(hand) }).digest).toBe(digestOf(hand));
+    // and the pinned domain decides it, not the request's
+    const other = { chainId: 1, verifyingContract: w.domain.verifyingContract };
+    expect(clientShouldSign({ state: hand }, view({ domain: other })).digest).toBe(
+      digestOf(hand, other),
+    );
+  });
+
+  test('myBalance: the baseline must give me what I know I have (a lying epoch message moves my chips)', () => {
+    const mine = base.balances[ME];
+    expect(verdict(hand, { myBalance: mine })).toEqual(yes(hand));
+    // the server moved a token unit, or all of it, from my seat to another in the baseline it showed me
+    for (const stolen of [1n, mine]) {
+      const poisoned = {
+        ...base,
+        balances: base.balances.map((b, i) => (i === ME ? b - stolen : i === 0 ? b + stolen : b)),
+      };
+      const r = verdict(hand, { baseline: poisoned, myBalance: mine });
+      expect(r).toEqual(refusedBy('VIEW'));
+      expect(r.detail).toMatch(/you know you have/);
+    }
+    // without myBalance the same poisoned baseline cannot be told apart, which is why the web step supplies it
+    for (const bad of [-1n, 5, '5', null, 1.5]) {
+      expect(verdict(hand, { myBalance: bad }), String(bad)).toEqual(refusedBy('VIEW'));
+    }
   });
 });
 
@@ -681,14 +841,14 @@ describe('a hostile server against an honest client over many rounds', () => {
   // the signing record before it signs, and reports every hand since the baseline as `observed`. The server
   // has no signing power of its own; it proposes whatever it likes. Invariants checked after every round:
   //   - one digest per nonce, ever signed by the client
-  //   - the nonce never goes back, and nothing is signed after a final
+  //   - the nonce never goes back or skips ahead, and nothing is signed after a final
   //   - every state the client signs is, balance for balance, the true result of the hands it watched
   for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
     test(`seed ${seed}`, () => {
       const rng = makeRng(seed * 7919);
       const world = makeWorld({ seed: 100 + seed, n: 3 });
       const me = 1;
-      const truthDeltas = []; // hands since the baseline, in chips: [d0, d1, d2], rake, pot
+      const truthDeltas = []; // hands since the last state I signed, in chips: [d0, d1, d2], rake, pot
       let baseline = world.genesis;
       let truth = world.genesis; // what the table really says right now (an honest server's state)
       let last = null;
@@ -820,9 +980,11 @@ describe('a hostile server against an honest client over many rounds', () => {
         } else {
           expect(finalSigned, 'a state signed after a final').toBe(false);
           expect(proposal.nonce > BigInt(highest), 'the nonce went back').toBe(true);
+          expect(proposal.nonce, 'the nonce skipped ahead').toBe(nextNonce);
           signedByNonce.set(proposal.nonce, digest);
           highest = proposal.nonce;
-          last = { nonce: proposal.nonce, digest, isFinal: proposal.isFinal };
+          last = { nonce: proposal.nonce, digest, isFinal: proposal.isFinal, state: proposal };
+          truthDeltas.length = 0; // `observed` is measured from the state I just signed
           if (proposal.isFinal) finalSigned = true;
           accepted++;
           // the money: this state is exactly the truth the client watched (balances, rake and volume)
@@ -837,7 +999,6 @@ describe('a hostile server against an honest client over many rounds', () => {
           // the baseline advances when the round completes (all signed): do it half the time
           if (rng.bool(0.6)) {
             baseline = proposal;
-            truthDeltas.length = 0;
             if (proposal.isFinal) break;
           }
         }
@@ -845,6 +1006,44 @@ describe('a hostile server against an honest client over many rounds', () => {
       expect(accepted).toBeGreaterThan(0);
     });
   }
+
+  test('honest play: five hands signed while the all-signed baseline lags behind, every one accepted', () => {
+    // The round of each hand is still open when the next request would come only in a broken server, but a
+    // client must not depend on the baseline having caught up: it builds on the state it signed.
+    const world = makeWorld({ seed: 555, n: 3 });
+    let signed = world.genesis;
+    let last = null;
+    for (let hand = 1; hand <= 5; hand++) {
+      const next = world.nextHand(signed, {
+        winner: hand % 3,
+        loser: (hand + 1) % 3,
+        amount: 10n * UNIT,
+        rake: UNIT,
+        pot: 20n * UNIT,
+      });
+      const deltas = [0, 0, 0];
+      deltas[hand % 3] = 9;
+      deltas[(hand + 1) % 3] = -10;
+      const r = clientShouldSign(
+        { state: next, domain: world.domain },
+        {
+          me: world.players[1],
+          domain: world.domain,
+          tableId: world.tableId,
+          roster: world.players,
+          unit: UNIT,
+          maxRakeBps: 500,
+          baseline: world.genesis, // never advances
+          last,
+          intent: 'play',
+          observed: { deltas, rake: 1, pot: 20 },
+        },
+      );
+      expect(r, `hand ${hand}`).toEqual({ ok: true, digest: hashState(next, world.domain) });
+      last = { nonce: next.nonce, digest: r.digest, isFinal: false, state: next };
+      signed = next;
+    }
+  });
 });
 
 describe('S1: the deal gate', () => {
@@ -859,20 +1058,24 @@ describe('S1: the deal gate', () => {
     });
   })();
   const members = (n = 3) => Array.from({ length: n }, () => ({ claimed: true, online: true }));
+  const verifyArgs = { arbiter: w.arbiter, sessionKeyOf: w.sessionKeyOf };
+  // the verifier and the table's identity are part of the view: the gate looks at the bundle itself
   const open = (over = {}) => ({
     active: true,
     roundOpen: false,
     head: 1n,
     bundle: good,
     members: members(),
+    verify: verifyArgs,
+    tableId: w.tableId,
+    domain: w.domain,
     ...over,
   });
-  const verifyArgs = { arbiter: w.arbiter, sessionKeyOf: w.sessionKeyOf };
 
   test('control: all conditions met', () => {
     expect(dealBlocker(open())).toBeNull();
     expect(canDeal(open())).toBe(true);
-    expect(dealBlocker(open({ verify: verifyArgs }))).toBeNull();
+    expect(dealBlocker(open({ roster: w.players }))).toBeNull();
   });
 
   test('every condition, alone, blocks, with the documented reason', () => {
@@ -949,7 +1152,7 @@ describe('S1: the deal gate', () => {
     }
   });
 
-  test('with `verify`, a bundle with a forged, swapped or foreign signature is a no (bundle-invalid)', () => {
+  test('a forged, swapped or foreign signature is a no (bundle-invalid)', () => {
     const swapped = {
       ...good,
       playerSigs: [good.playerSigs[1], good.playerSigs[0], good.playerSigs[2]],
@@ -987,28 +1190,56 @@ describe('S1: the deal gate', () => {
     expect(canDeal(noHeadKey)).toBe(false);
   });
 
-  test.todo('REVIEW GAP: without `verify`, a bundle of 65 zero bytes per signature opens the gate', () => {
-    // dealBlocker only checks that the signatures LOOK complete unless the caller also passes `verify`.
-    // S1 is "the last state has every signature": a gate that can be opened by junk should either require
-    // `verify` or say in its name that it does not verify.
+  test('REVIEW GAP: without `verify`, a bundle of 65 zero bytes per signature opens the gate', () => {
+    // The verifier is mandatory now: a gate that could be opened by signatures that merely LOOK complete
+    // is not S1 ("the last state has every signature").
     const junk = {
       ...good,
       arbiterSig: `0x${'00'.repeat(65)}`,
       playerSigs: good.playerSigs.map(() => `0x${'00'.repeat(65)}`),
     };
     expect(canDeal(open({ bundle: junk }))).toBe(false);
+    expect(dealBlocker(open({ bundle: junk }))?.reason).toBe('bundle-invalid');
+    expect(canDeal(open({ bundle: junk, verify: undefined }))).toBe(false);
+    expect(dealBlocker(open({ bundle: junk, verify: undefined }))?.reason).toBe('no-verifier');
+    // the same bundle with real signatures but no verifier is also closed
+    expect(dealBlocker(open({ verify: undefined }))?.reason).toBe('no-verifier');
+    expect(dealBlocker(open({ verify: null }))?.reason).toBe('no-verifier');
   });
 
-  test('without `verify` the gate does not look at who signed (documented), but verifyBundle does', () => {
-    const junk = { ...good, arbiterSig: `0x${'00'.repeat(65)}` };
-    expect(canDeal(open({ bundle: junk }))).toBe(true); // the documented limit of the cheap form
-    expect(verifyBundle(junk, verifyArgs).ok).toBe(false);
-  });
-
-  test('a bundle that is the head but belongs to another table passes the gate (the gate has no table to compare)', () => {
-    // documented here so nobody assumes otherwise: the coordinator must only ever hand it its own table's bundle
-    const other = { ...good, state: { ...good.state, tableId: `0x${'ee'.repeat(32)}` } };
-    expect(canDeal(open({ bundle: other }))).toBe(true);
+  test('a bundle that is the head and verifies, but is for another table, domain or roster, is a no', () => {
+    // The gate is told which table this is (tableId, domain, optionally roster) and compares the bundle
+    // with it, so a bundle that was legitimately signed elsewhere cannot open it.
+    const sign = (state, domain) => {
+      const digest = hashState(state, domain);
+      return makeBundle({
+        domain,
+        state,
+        arbiterSig: signDigest(w.arbiterKey, digest),
+        playerSigs: w.sessionKeys.map((k) => signDigest(k, digest)),
+      });
+    };
+    const otherTable = sign({ ...good.state, tableId: `0x${'ee'.repeat(32)}` }, w.domain);
+    const otherChain = sign(good.state, { ...w.domain, chainId: 1 });
+    const otherVault = sign(good.state, { ...w.domain, verifyingContract: `0x${'12'.repeat(20)}` });
+    for (const [name, bundle] of Object.entries({ otherTable, otherChain, otherVault })) {
+      expect(verifyBundle(bundle, verifyArgs).ok, `${name} verifies on its own terms`).toBe(true);
+      expect(dealBlocker(open({ bundle }))?.reason, name).toBe('bundle-wrong-table');
+      expect(canDeal(open({ bundle })), name).toBe(false);
+    }
+    const swapped = [w.players[1], w.players[0], w.players[2]];
+    expect(dealBlocker(open({ roster: swapped }))?.reason).toBe('bundle-wrong-table');
+    // what the gate is told about the table is validated like the rest of the view
+    for (const patch of [
+      { tableId: undefined },
+      { tableId: '0x12' },
+      { domain: undefined },
+      { domain: { chainId: 0, verifyingContract: w.domain.verifyingContract } },
+      { roster: w.players.slice(1) },
+      { roster: 'abc' },
+    ]) {
+      expect(dealBlocker(open(patch))?.reason, JSON.stringify(Object.keys(patch))).toBe('bad-view');
+    }
   });
 });
 
@@ -1049,7 +1280,15 @@ describe('S3: the co-sign age rule', () => {
     expect(serverMayCoSign({})).toBe(false);
   });
 
-  test.todo('REVIEW GAP (nit): a null argument is a no, not an exception (the predicates are documented as never throwing)', () => {
+  test('REVIEW GAP (nit): a null argument is a no, not an exception (the predicates are documented as never throwing)', () => {
     expect(serverMayCoSign(null)).toBe(false);
+    for (const junk of [5, 'x', true, [], Symbol('s'), () => 1])
+      expect(serverMayCoSign(junk)).toBe(false);
+    const trap = {
+      get sessionKeyAgeMs() {
+        throw new Error('getter');
+      },
+    };
+    expect(serverMayCoSign(trap)).toBe(false);
   });
 });

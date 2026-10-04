@@ -2,13 +2,14 @@
 // test/readme.test.js checks that README.md contains this file's code and that it still runs.
 import {
   buildNextState,
+  bundleConflict,
   bundleFromWire,
   bundleToWire,
   canDeal,
   checkState,
   clientShouldSign,
   decideSign,
-  genesisState,
+  epochBaseline,
   hashState,
   isNewer,
   makeBundle,
@@ -42,10 +43,12 @@ export function main() {
     return seat ? privateKeyToAddress(seat.sessionKey) : null;
   };
 
-  // The epoch starts: each player deposited 1000 chips and 7 token units of dust.
+  // The epoch starts: each player deposited 1000 chips and 7 token units of dust. A brand-new table has
+  // nonce, rake and volume 0, written out; a rolled-over epoch passes the table's nonce and rakePaid and the
+  // cumulative volume of the final state that closed the last epoch (depositState is only for exit digests).
   const tableId = tableKeyFor({ chainId: 31337, vault, serverId: 'pgg-1', generation: 1 });
   const deposits = players.map(() => toTokenUnits(1000, unit) + 7n);
-  const genesis = genesisState({ tableId, players, deposits });
+  const genesis = epochBaseline({ tableId, players, deposits, nonce: 0n, rake: 0n, volume: 0n });
   const table = {
     nonce: genesis.nonce,
     escrow: deposits.reduce((a, b) => a + b, 0n),
@@ -82,6 +85,7 @@ export function main() {
     unit,
     maxRakeBps,
     baseline: genesis,
+    myBalance: deposits[sorted.indexOf(seat)], // my own deposit record, never the server's message
     last: null,
     intent: 'play',
     observed: { deltas, rake: 2, pot: 200 },
@@ -91,7 +95,8 @@ export function main() {
   const refused = clientShouldSign({ state: forged, domain }, view(sorted[0]));
 
   // The nonce record is written before the signature is sent; asking again for the same digest is a repeat.
-  const digest = hashState(state, domain);
+  // A yes carries the digest the client computed: that is the one to sign.
+  const digest = verdicts[0].digest;
   const decision = decideSign({ req: { nonce: state.nonce, digest }, last: null });
   const again = decideSign({
     req: { nonce: state.nonce, digest },
@@ -103,9 +108,14 @@ export function main() {
     domain,
     state,
     arbiterSig: signDigest(arbiterKey, digest),
-    playerSigs: sorted.map((seat) => signDigest(seat.sessionKey, digest)),
+    playerSigs: sorted.map((seat, i) => signDigest(seat.sessionKey, verdicts[i].digest)),
   });
-  const verified = verifyBundle(bundle, { arbiter, sessionKeyOf });
+  // The browser has no chain access, so it also says which chain, vault, table and roster it expects.
+  const verified = verifyBundle(bundle, {
+    arbiter,
+    sessionKeyOf,
+    expect: { domain, tableId, players },
+  });
   const contractView = checkState(state, bundle, ctx); // what startExit would do with it
 
   // Over the wire (JSON) and back, then the table may deal the next hand.
@@ -117,6 +127,9 @@ export function main() {
     head: state.nonce,
     bundle: received,
     members,
+    verify: { arbiter, sessionKeyOf }, // required: the gate checks every signature itself
+    tableId,
+    domain,
   });
 
   return {
@@ -128,6 +141,8 @@ export function main() {
     verified,
     contractView,
     newer: isNewer(received, null),
+    conflict: bundleConflict(received, bundle), // null: two bundles at one nonce would be an alarm
+    hashed: hashState(state, domain),
     mayDeal,
   };
 }

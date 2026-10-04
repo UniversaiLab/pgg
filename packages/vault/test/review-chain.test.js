@@ -8,10 +8,18 @@
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { ContractFunctionRevertedError, keccak256, toHex } from 'viem';
-import { buildNextState, genesisState, sortRoster } from '../src/build.js';
+import {
+  buildNextState,
+  depositState,
+  epochBaseline,
+  genesisState,
+  sortRoster,
+} from '../src/build.js';
 import { checkSettle, checkState, tableFromChain } from '../src/check.js';
 import { hashState } from '../src/eip712.js';
+import { clientShouldSign } from '../src/rules.js';
 import { fromHex, privateKeyToAddress, signDigest } from '../src/sign.js';
+import { statesEqual } from '../src/state.js';
 import { chainDescribe, deployVault, startAnvil } from '../testing/index.js';
 import { UINT64_MAX, UINT256_MAX } from './gen.js';
 
@@ -1036,6 +1044,126 @@ chainDescribe('review: the library against the real PokerVault', () => {
         volume: final1.volume,
       });
       expect(asked.volume).toBe(final1.volume);
+    }, 60_000);
+
+    test('epochBaseline carries the cumulative volume (the next 2% hand is legal) and depositState is the contract’s exit state', async () => {
+      const DEP = 1_000n * 100n * UNIT;
+      const table = await openTable('rollover-fixed', [
+        { name: 'fixa', deposit: DEP },
+        { name: 'fixb', deposit: DEP },
+        { name: 'fixc', deposit: DEP },
+      ]);
+      const settler = await node.account('settle-caller-fixed');
+      const common = { tableId: table.tableId, players: table.players };
+
+      // epoch 1 on a brand-new table: nonce, rake and volume are written out as 0n
+      const g1 = epochBaseline({
+        ...common,
+        deposits: [DEP, DEP, DEP],
+        nonce: 0n,
+        rake: 0n,
+        volume: 0n,
+      });
+      const onChain1 = await read('depositState', [table.tableId, table.players]);
+      expect(statesEqual(depositState({ ...common, deposits: [DEP, DEP, DEP] }), onChain1)).toBe(
+        true,
+      );
+      expect(statesEqual(g1, onChain1)).toBe(true); // at volume 0 the two coincide
+      const pot = 50_000n * UNIT;
+      const rake = pot / 50n; // 2%
+      const hand1 = buildNextState({
+        prev: g1,
+        balances: [DEP + (pot / 2n - rake), DEP - pot / 2n, DEP],
+        rakeDelta: rake,
+        volumeDelta: pot,
+      });
+      const final1 = buildNextState({
+        prev: hand1,
+        balances: hand1.balances,
+        final: true,
+        keep: [true, true, true],
+      });
+      await vaultWrite(settler, 'settle', [final1, ...Object.values(await table.sign(final1))]);
+      await vaultWrite(deployed.arbiter, 'start', [table.tableId, table.players]);
+      const row = await table.tableRow();
+      expect(row.nonce).toBe(final1.nonce);
+      expect(row.rakePaid).toBe(rake);
+
+      // the exit state of the rolled-over epoch: the table's nonce and rakePaid, volume 0, same digest as the vault's
+      const exit = depositState({
+        ...common,
+        deposits: final1.balances,
+        nonce: row.nonce,
+        rake: row.rakePaid,
+      });
+      const onChain2 = await read('depositState', [table.tableId, table.players]);
+      expect(statesEqual(exit, onChain2)).toBe(true);
+      expect(onChain2.volume).toBe(0n);
+      expect(hashState(exit, domain)).toBe(await read('stateDigest', [onChain2]));
+
+      // the baseline for PLAYING on: the same, with the volume of the final state that closed epoch 1
+      const baseline = epochBaseline({
+        ...common,
+        deposits: final1.balances,
+        nonce: row.nonce,
+        rake: row.rakePaid,
+        volume: final1.volume,
+      });
+      expect(baseline).toEqual({ ...exit, volume: final1.volume });
+      const pot2 = 2_000n * UNIT;
+      const rake2 = pot2 / 50n;
+      const play = (prev) =>
+        buildNextState({
+          prev,
+          balances: [
+            prev.balances[0] + (pot2 / 2n - rake2),
+            prev.balances[1] - pot2 / 2n,
+            prev.balances[2],
+          ],
+          rakeDelta: rake2,
+          volumeDelta: pot2,
+        });
+      const onBaseline = play(baseline);
+      expect(
+        await sameAsContract(
+          table,
+          onBaseline,
+          await table.sign(onBaseline),
+          'hand on epochBaseline',
+        ),
+      ).toBe('ok');
+      const onExitState = play(exit);
+      expect(
+        await sameAsContract(
+          table,
+          onExitState,
+          await table.sign(onExitState),
+          'hand on depositState',
+        ),
+      ).toBe('RakeTooHigh');
+
+      // and the client rule agrees with the contract about both baselines (it is the same cumulative cap)
+      const maxRakeBps = Number(await read('MAX_RAKE_BPS'));
+      const clientView = (base) => ({
+        me: table.players[1],
+        domain,
+        tableId: table.tableId,
+        roster: table.players,
+        unit: UNIT,
+        maxRakeBps,
+        baseline: base,
+        last: null,
+        intent: 'play',
+        observed: { deltas: [960, -1000, 0], rake: 40, pot: 2_000 },
+      });
+      expect(clientShouldSign({ state: onBaseline, domain }, clientView(baseline))).toEqual({
+        ok: true,
+        digest: hashState(onBaseline, domain),
+      });
+      expect(clientShouldSign({ state: onExitState, domain }, clientView(exit))).toMatchObject({
+        ok: false,
+        rule: 'C1e',
+      });
     }, 60_000);
   });
 

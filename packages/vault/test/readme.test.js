@@ -14,13 +14,15 @@ describe('README worked example', () => {
   test('it runs and every step does what the comments say', () => {
     const r = main();
     expect(r.proposal.ok).toBe(true);
-    expect(r.verdicts).toEqual([{ ok: true }, { ok: true }, { ok: true }]);
+    // every yes carries the digest the client computed, and it is the state's digest
+    expect(r.verdicts).toEqual([1, 2, 3].map(() => ({ ok: true, digest: r.hashed })));
     expect(r.refused).toMatchObject({ ok: false, rule: 'C1c' });
     expect(r.decision).toBe('new');
     expect(r.again).toBe('repeat');
     expect(r.verified).toMatchObject({ ok: true });
     expect(r.contractView).toEqual({ ok: true, digest: r.verified.digest });
     expect(r.newer).toBe(true);
+    expect(r.conflict).toBeNull();
     expect(r.mayDeal).toBe(true);
   });
 });

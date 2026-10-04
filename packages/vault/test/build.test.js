@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { buildNextState, genesisState, sortRoster } from '../src/build.js';
+import {
+  buildNextState,
+  depositState,
+  epochBaseline,
+  genesisState,
+  sortRoster,
+} from '../src/build.js';
+import { checkState } from '../src/check.js';
 import { statesEqual } from '../src/state.js';
+import { makeWorld, UNIT } from './fixtures.js';
 import { makeRng, randomRoster, UINT64_MAX } from './gen.js';
 
 const A = `0x${'00'.repeat(19)}01`;
@@ -37,6 +45,138 @@ describe('genesisState', () => {
     );
     expect(() => genesisState({ tableId, players: [A, B], deposits: [1n] })).toThrow(RangeError);
     expect(() => genesisState({ tableId, players: [A, B], deposits: null })).toThrow(RangeError);
+  });
+});
+
+describe('genesisState with a volume', () => {
+  test('volume is optional, defaults to 0n and is carried when given', () => {
+    const plain = genesisState({ tableId, players: [A, B], deposits: [1n, 2n] });
+    expect(plain.volume).toBe(0n);
+    const carried = genesisState({
+      tableId,
+      players: [A, B],
+      deposits: [1n, 2n],
+      nonce: 9n,
+      rake: 4n,
+      volume: 200n,
+    });
+    expect(carried).toMatchObject({ nonce: 9n, rake: 4n, volume: 200n });
+    expect(genesisState({ tableId, players: [A, B], deposits: [1n, 2n], volume: 7 }).volume).toBe(
+      7n,
+    );
+  });
+
+  test('a volume that is not a non-negative integer is refused', () => {
+    for (const volume of [-1n, 1.5, '5', null, Number.NaN, 2n ** 256n]) {
+      expect(() => genesisState({ tableId, players: [A, B], deposits: [1n, 2n], volume })).toThrow(
+        RangeError,
+      );
+    }
+  });
+});
+
+describe('depositState: the exit digest state, volume pinned to 0', () => {
+  test('is the contract’s _depositState: balances are deposits, nonce and rake are the table’s, volume 0', () => {
+    const d = depositState({
+      tableId,
+      players: [A, B, C],
+      deposits: [5n, 6n, 7n],
+      nonce: 9n,
+      rake: 4n,
+    });
+    expect(d).toEqual({
+      tableId,
+      nonce: 9n,
+      isFinal: false,
+      players: [A, B, C],
+      balances: [5n, 6n, 7n],
+      keep: [false, false, false],
+      rake: 4n,
+      volume: 0n,
+    });
+    expect(depositState({ tableId, players: [A, B], deposits: [1, 2] })).toEqual(
+      genesisState({ tableId, players: [A, B], deposits: [1, 2] }),
+    );
+  });
+
+  test('has no volume option: asking for one is an error, not a silently different exit digest', () => {
+    for (const volume of [0n, 1n, undefined, null]) {
+      expect(() => depositState({ tableId, players: [A, B], deposits: [1n, 2n], volume })).toThrow(
+        /no volume/,
+      );
+    }
+  });
+
+  test('refuses what genesisState refuses', () => {
+    expect(() => depositState({ tableId, players: [B, A], deposits: [1n, 2n] })).toThrow(
+      RangeError,
+    );
+    expect(() => depositState({ tableId, players: [A, B], deposits: [1n] })).toThrow(RangeError);
+    expect(() => depositState({ tableId, players: 'AB', deposits: [1n, 2n] })).toThrow(RangeError);
+  });
+});
+
+describe('epochBaseline: where the first hand of an epoch starts, with the cumulative rake and volume', () => {
+  const args = { tableId, players: [A, B, C], deposits: [5n, 6n, 7n] };
+
+  test('carries nonce, rake and volume as given', () => {
+    const b = epochBaseline({ ...args, nonce: 9n, rake: 20n, volume: 1000n });
+    expect(b).toEqual({
+      tableId,
+      nonce: 9n,
+      isFinal: false,
+      players: [A, B, C],
+      balances: [5n, 6n, 7n],
+      keep: [false, false, false],
+      rake: 20n,
+      volume: 1000n,
+    });
+    expect(epochBaseline({ ...args, nonce: 0n, rake: 0n, volume: 0n }).volume).toBe(0n);
+  });
+
+  test('nonce, rake and volume are all required: a default is exactly how volume got lost', () => {
+    const full = { nonce: 1n, rake: 2n, volume: 3n };
+    for (const missing of ['nonce', 'rake', 'volume']) {
+      const partial = { ...args, ...full, [missing]: undefined };
+      expect(() => epochBaseline(partial), missing).toThrow(new RegExp(`${missing} is required`));
+    }
+    expect(() => epochBaseline(args)).toThrow(RangeError);
+  });
+
+  test('is the same state as genesisState with everything spelled out, and differs from depositState only in volume', () => {
+    const b = epochBaseline({ ...args, nonce: 9n, rake: 20n, volume: 1000n });
+    expect(b).toEqual(genesisState({ ...args, nonce: 9n, rake: 20n, volume: 1000n }));
+    expect({ ...b, volume: 0n }).toEqual(depositState({ ...args, nonce: 9n, rake: 20n }));
+  });
+
+  test('a 2% hand in a rolled-over epoch is legal on the epoch baseline and RakeTooHigh on the deposit state', () => {
+    // 20 chips of rake were paid out of 1000 chips of volume (2%). Epoch 2 starts; one more hand, pot 200,
+    // rake 4 (2%): the cumulative share is 24 of 1200, still 2%.
+    const w = makeWorld({ seed: 31, n: 3 });
+    const rakePaid = 20n * UNIT;
+    const common = {
+      tableId: w.tableId,
+      players: w.players,
+      deposits: w.deposits,
+      nonce: 9n,
+      rake: rakePaid,
+    };
+    const escrow = w.deposits.reduce((a, d) => a + d, 0n);
+    const ctx = w.ctx({ table: { nonce: 9n, rakePaid, escrow } });
+    const play = (prev) =>
+      buildNextState({
+        prev,
+        balances: prev.balances.map((b, i) =>
+          i === 0 ? b + 96n * UNIT : i === 1 ? b - 100n * UNIT : b,
+        ),
+        rakeDelta: 4n * UNIT,
+        volumeDelta: 200n * UNIT,
+      });
+    const onDeposit = play(depositState(common));
+    expect(checkState(onDeposit, null, ctx)).toMatchObject({ ok: false, error: 'RakeTooHigh' });
+    const onBaseline = play(epochBaseline({ ...common, volume: 1000n * UNIT }));
+    expect(checkState(onBaseline, null, ctx)).toMatchObject({ ok: true });
+    expect(onBaseline.volume).toBe(1200n * UNIT);
   });
 });
 

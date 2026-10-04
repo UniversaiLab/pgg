@@ -2,9 +2,9 @@
 // decimal-string wire format, address handling against the contract's keccak256(abi.encodePacked(address[])),
 // aliasing and mutation, and the chip <-> token conversions near 2^53.
 //
-// Titles starting with "REVIEW BUG" fail on purpose today: each pins down a defect found in the review (see
-// the report) and passes once src is fixed. Titles starting with "REVIEW GAP" are `test.todo` specs: they do
-// not run by default; `bun test --todo` runs them and shows what they would assert.
+// Titles starting with "REVIEW BUG" failed on purpose before the fix: each pins down a defect found in the
+// review and is now a regression test. Titles starting with "REVIEW GAP" were `test.todo` specs; the ones
+// that were fixed run as ordinary tests, and any that is still `test.todo` says why at the top of its body.
 import { describe, expect, test } from 'bun:test';
 import { encodePacked, keccak256 } from 'viem';
 import { buildNextState, genesisState, sortRoster } from '../src/build.js';
@@ -500,7 +500,7 @@ describe('rosterHash is the contract’s keccak256(abi.encodePacked(address[]))'
 describe('the holes in an array', () => {
   // JSON.parse can never produce a hole, but code can (`new Array(3)`, `delete a[1]`). Array.prototype.map
   // and every skip holes, so a hole sails through per-element validation.
-  test.todo('REVIEW GAP (nit): normalizeState must not return arrays with holes', () => {
+  test('REVIEW GAP (nit): normalizeState must not return arrays with holes', () => {
     for (const field of ['balances', 'keep']) {
       let out;
       try {
@@ -514,10 +514,43 @@ describe('the holes in an array', () => {
     }
   });
 
-  test.todo('REVIEW GAP (nit): a state with holes is not equal to a state with values', () => {
+  test('REVIEW GAP (nit): a state with holes is not equal to a state with values', () => {
     const real = normalizeState(internal());
     const holey = { ...real, balances: new Array(3), keep: new Array(3) };
     expect(statesEqual(holey, real)).toBe(false); // Array.prototype.every skips the holes
+    expect(statesEqual(real, holey)).toBe(false);
+    expect(statesEqual(holey, holey)).toBe(false); // a hole is never equal to anything, itself included
+    const holeyPlayers = { ...real, players: new Array(3) };
+    expect(statesEqual(holeyPlayers, holeyPlayers)).toBe(false);
+    expect(statesEqual(real, { ...real })).toBe(true);
+  });
+
+  test('every array of a state refuses a hole by name, in decodeState, normalizeState and fromWire', () => {
+    const hole = (list, at) => {
+      const copy = [...list];
+      delete copy[at];
+      return copy;
+    };
+    for (const [field, values] of Object.entries({
+      players: internal().players,
+      balances: internal().balances,
+      keep: internal().keep,
+    })) {
+      const holey = hole(values, 1);
+      expect(() => normalizeState(internal({ [field]: holey })), field).toThrow(
+        new RegExp(`${field}\\[1\\]`),
+      );
+      expect(() => decodeState(internal({ [field]: holey })), field).toThrow(RangeError);
+    }
+    expect(() => fromWire(wire({ keep: hole([false, false, false], 2) }))).toThrow(/keep\[2\]/);
+    expect(() => fromWire(wire({ balances: hole(['10', '20', '30'], 0) }))).toThrow(RangeError);
+  });
+
+  test('toWire and hashState refuse a state with holes (no digest for something unsigned)', () => {
+    const w = makeWorld({ seed: 2 });
+    const holey = { ...w.genesis, keep: new Array(3) };
+    expect(() => toWire(holey)).toThrow(RangeError);
+    expect(() => hashState(holey, w.domain)).toThrow(RangeError);
   });
 
   test('a hole is at least never approved: hashing throws and checkState does not say ok', () => {
@@ -533,6 +566,41 @@ describe('the holes in an array', () => {
       }
       expect(verdict.ok, field).toBe(false);
     }
+  });
+});
+
+describe('over-long arrays are refused before anything walks them', () => {
+  const huge = (n) => new Array(n).fill('1');
+
+  test('fromWire on 2 million entries is one comparison, not 2 million conversions', () => {
+    const started = performance.now();
+    for (const field of ['players', 'balances', 'keep']) {
+      expect(() => fromWire(wire({ [field]: huge(2_000_000) })), field).toThrow(RangeError);
+    }
+    const sparse = new Array(2_000_000); // would cost a full scan for holes if the length came second
+    for (const field of ['players', 'balances', 'keep']) {
+      expect(() => fromWire(wire({ [field]: sparse })), field).toThrow(RangeError);
+    }
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
+  test('normalizeState too, and the limit is the table size: 10 passes, 11 does not', () => {
+    const big = Array.from({ length: 2_000_000 }, (_, i) => addr(BigInt(i + 1)));
+    expect(() => normalizeState(internal({ players: big }))).toThrow(/players must have 2 to 10/);
+    expect(() => normalizeState(internal({ balances: new Array(2_000_000).fill(1n) }))).toThrow(
+      /balances must have one entry per player/,
+    );
+    const roster = (n) => Array.from({ length: n }, (_, i) => addr(BigInt(i + 1)));
+    const state = (n) =>
+      internal({
+        players: roster(n),
+        balances: new Array(n).fill(1n),
+        keep: new Array(n).fill(false),
+      });
+    expect(normalizeState(state(10)).players).toHaveLength(10);
+    expect(() => normalizeState(state(11))).toThrow(/players must have 2 to 10/);
+    // decodeState is as loose as the contract's ABI decoder: it still accepts 11
+    expect(decodeState(state(11)).players).toHaveLength(11);
   });
 });
 
@@ -743,7 +811,7 @@ describe('build.js', () => {
     ).toEqual([true, false, true]);
   });
 
-  test.todo('REVIEW GAP (nit): final must be a boolean; the string "false" must not make a final state', () => {
+  test('REVIEW GAP (nit): final must be a boolean; the string "false" must not make a final state', () => {
     // Boolean('false') is true, so `final: 'false'` (a flag read from a config or a query string) would
     // quietly produce an isFinal state, the kind that can pay out the table.
     let state;
@@ -754,6 +822,17 @@ describe('build.js', () => {
       return;
     }
     expect(state.isFinal).toBe(false);
+  });
+
+  test('final accepts true, false and nothing else', () => {
+    const prev = genesis();
+    const balances = [10n, 20n, 30n];
+    expect(buildNextState({ prev, balances, final: true }).isFinal).toBe(true);
+    expect(buildNextState({ prev, balances, final: false }).isFinal).toBe(false);
+    expect(buildNextState({ prev, balances }).isFinal).toBe(false);
+    for (const final of ['false', 'true', '', 0, 1, null, {}, []]) {
+      expect(() => buildNextState({ prev, balances, final }), String(final)).toThrow(/final/);
+    }
   });
 
   test('REVIEW BUG: genesisState must be able to carry the cumulative volume of a rolled-over epoch', () => {

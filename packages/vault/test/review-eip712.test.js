@@ -373,13 +373,20 @@ describe('STATE_TYPES is the single source: a child process changes it and the l
     expect(out.exitCode, new TextDecoder().decode(out.stderr)).toBe(0);
     return JSON.parse(new TextDecoder().decode(out.stdout));
   };
+  // STATE_TYPES is frozen, so a child cannot edit it. It serves an edited COPY under the same specifier
+  // instead (a Bun plugin), which is what "the library is driven by STATE_TYPES and nothing else" needs.
+  const protocolFile = Bun.resolveSync('@pgg/protocol/vault', root);
+  const withTypes = (edit) => `
+    const real = await import(${JSON.stringify(protocolFile)});
+    const types = { State: real.STATE_TYPES.State.map((f) => ({ ...f })) };
+    ${edit}
+    Bun.plugin({ setup(build) { build.module('@pgg/protocol/vault', () => ({ exports: { ...real, STATE_TYPES: types }, loader: 'object' })); } });
+  `;
   const state = `{ tableId: '0x' + '11'.repeat(32), nonce: 1n, isFinal: true, players: ['0x' + '00'.repeat(19) + '01', '0x' + '00'.repeat(19) + '02'], balances: [1n, 2n], keep: [true, false], rake: 3n, volume: 4n }`;
 
   test('swapping two fields before eip712.js loads changes the type string, the typehash and the digest', () => {
     const swapped = run(`
-      import { STATE_TYPES } from '@pgg/protocol/vault';
-      const t = STATE_TYPES.State;
-      [t[1], t[2]] = [t[2], t[1]];
+      ${withTypes('[types.State[1], types.State[2]] = [types.State[2], types.State[1]];')}
       const E = await import('${root}src/eip712.js');
       const s = ${state};
       process.stdout.write(JSON.stringify({ type: E.STATE_TYPE_STRING, hash: E.STATE_TYPEHASH, digest: E.hashState(s, { chainId: 1, verifyingContract: '0x' + '00'.repeat(19) + '01' }) }));
@@ -403,8 +410,7 @@ describe('STATE_TYPES is the single source: a child process changes it and the l
         process.execPath,
         '-e',
         `
-        import { STATE_TYPES } from '@pgg/protocol/vault';
-        STATE_TYPES.State.push({ name: 'extra', type: 'bytes' });
+        ${withTypes("types.State.push({ name: 'extra', type: 'bytes' });")}
         try { await import('${root}src/eip712.js'); process.stdout.write('loaded'); } catch (e) { process.stdout.write('refused: ' + e.message); }
       `,
       ],
@@ -415,7 +421,8 @@ describe('STATE_TYPES is the single source: a child process changes it and the l
     );
   });
 
-  test.todo('REVIEW GAP (nit, in @pgg/protocol): STATE_TYPES is a plain mutable object; changing it after eip712.js loaded makes hashStruct disagree with STATE_TYPEHASH', () => {
+  test('REVIEW GAP (nit, in @pgg/protocol): STATE_TYPES is a plain mutable object; changing it after eip712.js loaded makes hashStruct disagree with STATE_TYPEHASH', () => {
+    // Fixed in packages/protocol/src/vault.js (outside this package): the table is frozen all the way down.
     const frozen = run(`
         import { STATE_TYPES } from '@pgg/protocol/vault';
         process.stdout.write(JSON.stringify({ outer: Object.isFrozen(STATE_TYPES), inner: Object.isFrozen(STATE_TYPES.State) }));

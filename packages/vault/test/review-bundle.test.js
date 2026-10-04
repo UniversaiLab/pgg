@@ -2,12 +2,15 @@
 // the wire form survive a hostile peer. verifyBundle must agree with checkState's signature half (which the
 // anvil tests compare with the real contract) on every forgery below.
 //
-// "REVIEW BUG" titles fail on purpose today (see the report); `test.todo` bodies are design gaps as specs.
+// "REVIEW BUG" and "REVIEW GAP" titles are findings that have been fixed and stay as regression tests; a
+// `test.todo` would be a finding left open on purpose, with the reason on its first line.
 import { describe, expect, test } from 'bun:test';
 import {
+  bundleConflict,
   bundleDigest,
   bundleFromWire,
   bundleToWire,
+  EXPECT_ERRORS,
   isNewer,
   makeBundle,
   verifyBundle,
@@ -356,11 +359,11 @@ describe('what a bundle claims about itself is not checked against anything (doc
     expect(viaCheckState(foreign)).toEqual(bad('BadSignature', MAX));
   });
 
-  test.todo('REVIEW GAP: verifyBundle should accept the expected { domain, tableId } and refuse a bundle for another', () => {
+  test('REVIEW GAP: verifyBundle should accept the expected { domain, tableId } and refuse a bundle for another', () => {
     // The browser has no chain access ("client-side chain watching" is out of scope), so verifyBundle is the
     // only check it can run before storing "the newest all-signed bundle". A hostile server that holds a
     // bundle legitimately signed for another table (a session key reused across tables) with a high nonce
-    // could shadow the real one. The expectation is a third argument, e.g. { domain, tableId }.
+    // could shadow the real one. The expectation is `expect: { domain, tableId, players }`.
     const otherDomain = { chainId: 1, verifyingContract: w.domain.verifyingContract };
     const digest = hashState(s1, otherDomain);
     const foreign = makeBundle({
@@ -369,9 +372,91 @@ describe('what a bundle claims about itself is not checked against anything (doc
       arbiterSig: signDigest(w.arbiterKey, digest),
       playerSigs: w.sessionKeys.map((k) => signDigest(k, digest)),
     });
-    expect(verifyBundle(foreign, { ...keys, domain: w.domain, tableId: s1.tableId }).ok).toBe(
-      false,
-    );
+    const expectation = { domain: w.domain, tableId: s1.tableId, players: s1.players };
+    expect(verifyBundle(foreign, { ...keys, expect: expectation })).toMatchObject({
+      ok: false,
+      error: 'WrongDomain',
+    });
+    expect(verifyBundle(b1, { ...keys, expect: expectation })).toEqual(verifyBundle(b1, keys));
+  });
+
+  /** A bundle legitimately signed by the real keys, for a state and domain of the test's choosing. */
+  const signedFor = (state, domain = w.domain) => {
+    const digest = hashState(state, domain);
+    return makeBundle({
+      domain,
+      state,
+      arbiterSig: signDigest(w.arbiterKey, digest),
+      playerSigs: w.sessionKeys.map((k) => signDigest(k, digest)),
+    });
+  };
+
+  test('expect: another chain, vault, table or roster is refused with its own error, before any signature is read', () => {
+    const answer = (bundle, expect) => verifyBundle(bundle, { ...keys, expect });
+    const otherChain = signedFor(s1, { ...w.domain, chainId: 1 });
+    const otherVault = signedFor(s1, { ...w.domain, verifyingContract: `0x${'12'.repeat(20)}` });
+    const otherTable = signedFor({ ...s1, tableId: `0x${'ee'.repeat(32)}` });
+    for (const bundle of [otherChain, otherVault]) {
+      expect(verifyBundle(bundle, keys).ok).toBe(true); // consistent on its own terms
+      expect(answer(bundle, { domain: w.domain })).toMatchObject({ error: 'WrongDomain' });
+    }
+    expect(verifyBundle(otherTable, keys).ok).toBe(true);
+    expect(answer(otherTable, { tableId: s1.tableId })).toMatchObject({ error: 'WrongTable' });
+    // the roster: a bundle for the same table id with other players (a table id is only a name)
+    const reordered = [w.players[1], w.players[0], ...w.players.slice(2)];
+    const fewer = w.players.slice(0, 3);
+    for (const players of [reordered, fewer, [...w.players, `0x${'f'.repeat(40)}`]]) {
+      expect(answer(b1, { players })).toMatchObject({ ok: false, error: 'WrongRoster' });
+    }
+    // each answer names the thing that differs, and the three names are the exported catalogue
+    expect(EXPECT_ERRORS).toEqual(['WrongDomain', 'WrongTable', 'WrongRoster']);
+    for (const r of [
+      answer(otherChain, { domain: w.domain }),
+      answer(otherTable, { tableId: s1.tableId }),
+    ]) {
+      expect(EXPECT_ERRORS).toContain(r.error);
+      expect(r.args[0]).toMatch(/bundle is for/);
+    }
+    // it is checked first: a bundle with forged signatures AND the wrong table says wrong table
+    const forgedElsewhere = { ...otherTable, arbiterSig: otherTable.playerSigs[0] };
+    expect(answer(forgedElsewhere, { tableId: s1.tableId }).error).toBe('WrongTable');
+    expect(verifyBundle(forgedElsewhere, keys).error).toBe('BadSignature');
+    // matching, in any case spelling, passes
+    const shout = (h) => `0x${h.slice(2).toUpperCase()}`;
+    expect(
+      answer(b1, {
+        domain: { chainId: w.domain.chainId, verifyingContract: shout(w.domain.verifyingContract) },
+        tableId: shout(s1.tableId),
+        players: s1.players.map(shout),
+      }),
+    ).toEqual(verifyBundle(b1, keys));
+  });
+
+  test('expect: a malformed expectation is a caller bug and throws (a missing value must not skip the check)', () => {
+    for (const expect_ of [
+      null,
+      'x',
+      {},
+      { tableID: s1.tableId },
+      { domain: undefined },
+      { tableId: undefined },
+      { players: undefined },
+      { domain: w.domain, extra: 1 },
+    ]) {
+      expect(() => verifyBundle(b1, { ...keys, expect: expect_ }), JSON.stringify(expect_)).toThrow(
+        TypeError,
+      );
+    }
+    for (const expect_ of [
+      { domain: { chainId: 0, verifyingContract: w.domain.verifyingContract } },
+      { tableId: '0x12' },
+      { players: 'abc' },
+      { players: ['nope'] },
+    ]) {
+      expect(() => verifyBundle(b1, { ...keys, expect: expect_ }), JSON.stringify(expect_)).toThrow(
+        RangeError,
+      );
+    }
   });
 });
 
@@ -413,6 +498,45 @@ describe('isNewer', () => {
     expect(isNewer(at(100n), at(99n))).toBe(true);
   });
 
+  test('nonces given as decimal strings (the wire form) compare as numbers, and nothing else is guessed', () => {
+    const at = (nonce) => ({ state: { nonce } });
+    expect(isNewer(at('10'), at('9'))).toBe(true);
+    expect(isNewer(at('9'), at('10'))).toBe(false);
+    expect(isNewer(at('100'), at(99n))).toBe(true);
+    expect(isNewer(at(100), at('99'))).toBe(true);
+    expect(isNewer(at('10'), at('10'))).toBe(false);
+    expect(isNewer(at('18446744073709551615'), at('18446744073709551614'))).toBe(true);
+    // a value that is not plainly a uint64 is a TypeError, whichever side it is on, and also against null
+    for (const bad of [
+      '',
+      ' 1',
+      '1 ',
+      '01',
+      '-1',
+      '1.5',
+      '0x10',
+      '1e3',
+      'abc',
+      -1n,
+      -1,
+      1.5,
+      Number.NaN,
+      2n ** 64n,
+      '18446744073709551616',
+      null,
+      undefined,
+      {},
+      true,
+    ]) {
+      expect(() => isNewer(at(bad), at(1n)), `a=${String(bad)}`).toThrow(TypeError);
+      expect(() => isNewer(at(1n), at(bad)), `b=${String(bad)}`).toThrow(TypeError);
+      expect(() => isNewer(at(bad), null), `a=${String(bad)} vs null`).toThrow(TypeError);
+    }
+    expect(() => isNewer({}, null)).toThrow(TypeError);
+    expect(() => isNewer({ state: null }, null)).toThrow(TypeError);
+    expect(isNewer(null, at('x'))).toBe(false); // nothing to be newer than anything
+  });
+
   test('REVIEW BUG: a wire bundle (decimal-string nonces) is ordered by text, so "10" is not newer than "9"', () => {
     // isNewer reads state.nonce without checking its type. A store that keeps bundles in wire form (JSON) and
     // calls isNewer on them replaces the newest bundle with an older one the moment the nonce gains a digit.
@@ -425,11 +549,74 @@ describe('isNewer', () => {
       answer = true; // refusing a non-bundle is acceptable
     }
     expect(answer).toBe(true);
+    expect(isNewer(wire(10n), wire(9n))).toBe(true); // the choice made: strings are converted, not refused
+    expect(isNewer(wire(9n), wire(10n))).toBe(false);
   });
 
   test('a mix of bigint and number nonces compares by value', () => {
     expect(isNewer({ state: { nonce: 10 } }, { state: { nonce: 9n } })).toBe(true);
     expect(isNewer({ state: { nonce: 9 } }, { state: { nonce: 9n } })).toBe(false);
+  });
+});
+
+describe('bundleConflict: two fully signed states at one nonce is an alarm', () => {
+  const twinOf = (bundle, patch = {}, domain = w.domain) =>
+    makeBundle({
+      domain,
+      state: {
+        ...bundle.state,
+        balances: bundle.state.balances.map((b, i) => (i === 0 ? b + 1n : i === 1 ? b - 1n : b)),
+        ...patch,
+      },
+      ...sign(domain, {
+        ...bundle.state,
+        balances: bundle.state.balances.map((b, i) => (i === 0 ? b + 1n : i === 1 ? b - 1n : b)),
+        ...patch,
+      }),
+    });
+  const sign = (domain, state) => {
+    const digest = hashState(state, domain);
+    return {
+      arbiterSig: signDigest(w.arbiterKey, digest),
+      playerSigs: w.sessionKeys.map((k) => signDigest(k, digest)),
+    };
+  };
+
+  test('same table, domain and nonce with different digests reports both digests, in either order', () => {
+    const twin = twinOf(b1);
+    const expected = { nonce: b1.state.nonce, digests: [bundleDigest(b1), bundleDigest(twin)] };
+    expect(bundleConflict(b1, twin)).toEqual(expected);
+    expect(bundleConflict(twin, b1)).toEqual({
+      nonce: expected.nonce,
+      digests: [...expected.digests].reverse(),
+    });
+    // the state differing only in a keep flag or isFinal is a different digest too
+    expect(bundleConflict(b1, twinOf(b1, { isFinal: true }))).not.toBeNull();
+  });
+
+  test('no conflict: the same bundle, a different nonce, another table or another domain', () => {
+    expect(bundleConflict(b1, b1)).toBeNull();
+    expect(bundleConflict(b1, makeBundle({ ...b1 }))).toBeNull();
+    expect(bundleConflict(b1, b2)).toBeNull();
+    expect(bundleConflict(b2, b1)).toBeNull();
+    expect(bundleConflict(b1, twinOf(b1, { tableId: `0x${'ee'.repeat(32)}` }))).toBeNull();
+    const elsewhere = { ...w.domain, chainId: 1 };
+    expect(bundleConflict(b1, twinOf(b1, {}, elsewhere))).toBeNull();
+  });
+
+  test('a conflict is what isNewer cannot say: neither is newer, and both verify', () => {
+    const twin = twinOf(b1);
+    expect(isNewer(twin, b1)).toBe(false);
+    expect(isNewer(b1, twin)).toBe(false);
+    expect(verifyBundle(twin, keys).ok).toBe(true);
+    expect(bundleConflict(b1, twin)).not.toBeNull();
+  });
+
+  test('a value that is not a bundle is a RangeError (verify first), a wire bundle is not accepted', () => {
+    for (const junk of [null, undefined, 5, 'x', {}, { ...b1, state: null }, bundleToWire(b1)]) {
+      expect(() => bundleConflict(b1, junk), String(junk)).toThrow(RangeError);
+      expect(() => bundleConflict(junk, b1), String(junk)).toThrow(RangeError);
+    }
   });
 });
 
@@ -518,7 +705,7 @@ describe('makeBundle, bundleToWire and bundleFromWire', () => {
     ).toThrow(RangeError);
   });
 
-  test.todo('REVIEW GAP (nit): a sparse playerSigs array must not become a bundle (verifyBundle then throws, it does not answer)', () => {
+  test('REVIEW GAP (nit): a sparse playerSigs array must not become a bundle (verifyBundle then throws, it does not answer)', () => {
     let bundle;
     try {
       bundle = makeBundle({
@@ -532,6 +719,37 @@ describe('makeBundle, bundleToWire and bundleFromWire', () => {
       return;
     }
     expect(verifyBundle(bundle, keys).ok).toBe(false); // otherwise a result, never an exception
+  });
+
+  test('verifyBundle answers (never a TypeError) for bundles with holes, junk and the wrong shape', () => {
+    const holey = [...b1.playerSigs];
+    delete holey[2];
+    const shapes = [
+      { ...b1, playerSigs: new Array(4) },
+      { ...b1, playerSigs: holey },
+      { ...b1, state: { ...b1.state, balances: new Array(4) } },
+      { ...b1, state: { ...b1.state, keep: holey } },
+      { ...b1, state: { ...b1.state, players: new Array(4) } },
+      { ...b1, arbiterSig: 5 },
+      { ...b1, playerSigs: null },
+      { ...b1, state: undefined },
+      null,
+      undefined,
+      'bundle',
+      5,
+      [],
+    ];
+    for (const [i, bundle] of shapes.entries()) {
+      let answer;
+      expect(() => {
+        answer = verifyBundle(bundle, keys);
+      }, `shape ${i}`).not.toThrow();
+      expect(answer, `shape ${i}`).toMatchObject({ ok: false });
+      expect(typeof answer.error, `shape ${i}`).toBe('string');
+    }
+    for (const bundle of [shapes[0], shapes[1]]) {
+      expect(() => makeBundle(bundle)).toThrow(RangeError);
+    }
   });
 
   test('every public function leaves a frozen bundle alone', () => {

@@ -53,7 +53,8 @@ const record = (state, isFinal = false) => ({
   digest: digestOf(state),
   isFinal,
 });
-const ok = { ok: true };
+// a yes carries the digest the client computed itself: the one it signs
+const signs = (state = hand) => ({ ok: true, digest: digestOf(state) });
 const refused = (rule) => expect.objectContaining({ ok: false, rule });
 
 const move = (state, patch) => ({ ...state, ...patch });
@@ -62,11 +63,11 @@ const withBalance = (state, i, delta) =>
 
 describe('clientShouldSign: an honest request', () => {
   test('a normal hand is signed', () => {
-    expect(clientShouldSign(req(), view())).toEqual(ok);
+    expect(clientShouldSign(req(), view())).toEqual(signs());
   });
 
   test('works with only the state in the request', () => {
-    expect(clientShouldSign({ state: hand }, view())).toEqual(ok);
+    expect(clientShouldSign({ state: hand }, view())).toEqual(signs());
   });
 
   test('observed chips may be bigint', () => {
@@ -75,7 +76,7 @@ describe('clientShouldSign: an honest request', () => {
         req(),
         view({ observed: { deltas: [98n, -100n, 0n], rake: 2n, pot: 200n } }),
       ),
-    ).toEqual(ok);
+    ).toEqual(signs());
   });
 
   test('the next hand extends the one the client signed last', () => {
@@ -91,7 +92,7 @@ describe('clientShouldSign: an honest request', () => {
       last: record(hand),
       observed: { deltas: [-30, 0, 29], rake: 1, pot: 60 },
     });
-    expect(clientShouldSign(req(next), v)).toEqual(ok);
+    expect(clientShouldSign(req(next), v)).toEqual(signs(next));
   });
 
   test('with no observed hand, a state that changes nothing is fine (a pure rotation)', () => {
@@ -101,20 +102,22 @@ describe('clientShouldSign: an honest request', () => {
       final: true,
       keep: [true, true, true],
     });
-    expect(clientShouldSign(req(quiet), view({ observed: null, intent: 'rotate' }))).toEqual(ok);
+    expect(clientShouldSign(req(quiet), view({ observed: null, intent: 'rotate' }))).toEqual(
+      signs(quiet),
+    );
   });
 
   test('a hand where nobody won anything and a rake of zero', () => {
     const flat = buildNextState({ prev: base, balances: base.balances, volumeDelta: 4n * UNIT });
     expect(
       clientShouldSign(req(flat), view({ observed: { deltas: [0, 0, 0], rake: 0, pot: 4 } })),
-    ).toEqual(ok);
+    ).toEqual(signs(flat));
   });
 
   test('dust (a balance that is not a multiple of the unit) rides along untouched', () => {
     // the fixture deposits end in 0, 1 and 2 token units of dust; the hand moved whole chips only
     expect(hand.balances[ME] % UNIT).toBe(base.balances[ME] % UNIT);
-    expect(clientShouldSign(req(), view())).toEqual(ok);
+    expect(clientShouldSign(req(), view())).toEqual(signs());
   });
 });
 
@@ -145,10 +148,10 @@ describe('C1a: nonce and equivocation', () => {
   });
 
   test('the identical digest again is approved, so the same signature can be re-sent', () => {
-    expect(clientShouldSign(req(), view({ last: record(hand) }))).toEqual(ok);
+    expect(clientShouldSign(req(), view({ last: record(hand) }))).toEqual(signs());
     // even if the client's picture of the table has moved on since: it already vouched for this state
-    expect(clientShouldSign(req(), view({ last: record(hand), observed: null }))).toEqual(ok);
-    expect(clientShouldSign(req(), view({ last: record(hand), baseline: hand }))).toEqual(ok);
+    expect(clientShouldSign(req(), view({ last: record(hand), observed: null }))).toEqual(signs());
+    expect(clientShouldSign(req(), view({ last: record(hand), baseline: hand }))).toEqual(signs());
   });
 
   test('a repeat of a final state is approved too', () => {
@@ -158,7 +161,7 @@ describe('C1a: nonce and equivocation', () => {
         req(final),
         view({ last: record(final, true), intent: 'leave', observed: null }),
       ),
-    ).toEqual(ok);
+    ).toEqual(signs(final));
   });
 
   test('a nonce that does not beat the baseline is refused even with no signing record', () => {
@@ -256,7 +259,7 @@ describe('C1c: conservation against the last all-signed baseline', () => {
       pot: 20n * UNIT,
     });
     const v = view({ baseline: hand, observed: { deltas: [-10, 0, 9], rake: 1, pot: 20 } });
-    expect(clientShouldSign(req(second), v)).toEqual(ok);
+    expect(clientShouldSign(req(second), v)).toEqual(signs(second));
     // rake taken but not deducted from anyone: balances + rake no longer match
     const cheat = move(second, { rake: second.rake + UNIT });
     expect(clientShouldSign(req(cheat), v)).toEqual(refused('C1c'));
@@ -329,7 +332,7 @@ describe('C1d: the pinned table, roster and domain', () => {
 
   test('the digest comparison ignores case', () => {
     const loud = `0x${digestOf(hand).slice(2).toUpperCase()}`;
-    expect(clientShouldSign({ state: hand, digest: loud }, view())).toEqual(ok);
+    expect(clientShouldSign({ state: hand, digest: loud }, view())).toEqual(signs());
   });
 
   test('identity is checked before anything about nonces or money', () => {
@@ -350,7 +353,7 @@ describe('C1d: the pinned table, roster and domain', () => {
 describe('C1e: the rake cap', () => {
   test("rake above the vault's share of volume is refused even when everything else matches", () => {
     // hand rake is 2 of 200 = 100 bps
-    expect(clientShouldSign(req(), view({ maxRakeBps: 100 }))).toEqual(ok);
+    expect(clientShouldSign(req(), view({ maxRakeBps: 100 }))).toEqual(signs());
     const r = clientShouldSign(req(), view({ maxRakeBps: 99 }));
     expect(r).toEqual(refused('C1e'));
     expect(r.detail).toMatch(/bps/);
@@ -391,7 +394,7 @@ describe('C1e: the rake cap', () => {
         req(next),
         view({ baseline: rich, observed: { deltas: [1, -4, 0], rake: 3, pot: 8 } }),
       ),
-    ).toEqual(ok);
+    ).toEqual(signs(next));
   });
 
   test('is reported before conservation and amounts', () => {
@@ -412,7 +415,9 @@ describe('C2: final states', () => {
   });
 
   test('a leaving player signs a final state that pays them out', () => {
-    expect(clientShouldSign(req(leave), view({ observed: null, intent: 'leave' }))).toEqual(ok);
+    expect(clientShouldSign(req(leave), view({ observed: null, intent: 'leave' }))).toEqual(
+      signs(leave),
+    );
   });
 
   test('a leaving player refuses a final state that keeps their chips at the table', () => {
@@ -432,7 +437,7 @@ describe('C2: final states', () => {
     ]) {
       expect(
         clientShouldSign(req(finalOf(keep)), view({ observed: null, intent: 'rotate' })),
-      ).toEqual(ok);
+      ).toEqual(signs(finalOf(keep)));
     }
   });
 
@@ -460,7 +465,7 @@ describe('C2: final states', () => {
       final: true,
       keep: [true, true, true],
     });
-    expect(clientShouldSign(req(folded), view({ intent: 'rotate' }))).toEqual(ok);
+    expect(clientShouldSign(req(folded), view({ intent: 'rotate' }))).toEqual(signs(folded));
     expect(
       clientShouldSign(
         req(withBalance(withBalance(folded, 0, 1n), 2, -1n)),
@@ -719,15 +724,19 @@ describe('S1: canDeal', () => {
   const sigs = w.sign(state);
   const bundle = makeBundle({ domain: w.domain, state, ...sigs });
   const members = w.players.map(() => ({ claimed: true, online: true }));
+  const keys = { arbiter: w.arbiter, sessionKeyOf: w.sessionKeyOf };
+  // the verifier and what this table is are required: the gate checks the bundle itself
   const open = (over = {}) => ({
     active: true,
     roundOpen: false,
     head: state.nonce,
     bundle,
     members,
+    verify: keys,
+    tableId: w.tableId,
+    domain: w.domain,
     ...over,
   });
-  const keys = { arbiter: w.arbiter, sessionKeyOf: w.sessionKeyOf };
   const blocked = (reason) => expect.objectContaining({ reason });
 
   test('true when the last state is fully signed and everyone is here', () => {
@@ -737,7 +746,13 @@ describe('S1: canDeal', () => {
 
   test('true for the first hand of an epoch: nothing proposed, nothing to wait for', () => {
     expect(canDeal(open({ head: null, bundle: null }))).toBe(true);
-    expect(canDeal(open({ head: undefined, bundle: undefined }))).toBe(true);
+  });
+
+  test('a missing head is a bad view, not "no hand yet": only an explicit null opens the first hand', () => {
+    expect(dealBlocker(open({ head: undefined, bundle: undefined }))).toEqual(blocked('bad-view'));
+    const noHeadKey = open({ bundle: null });
+    delete noHeadKey.head;
+    expect(dealBlocker(noHeadKey)).toEqual(blocked('bad-view'));
   });
 
   test('returns real booleans', () => {
@@ -817,14 +832,28 @@ describe('S1: canDeal', () => {
     expect(canDeal(open({ bundle: { state: null } }))).toBe(false);
   });
 
-  test('with verify, the signatures themselves are checked, not just their presence', () => {
-    expect(canDeal(open({ verify: keys }))).toBe(true);
+  test('the signatures themselves are checked, not just their presence', () => {
+    expect(canDeal(open())).toBe(true);
     const forged = { ...bundle, playerSigs: [bundle.playerSigs[1], ...bundle.playerSigs.slice(1)] };
-    expect(canDeal(open({ bundle: forged }))).toBe(true); // looks complete
-    expect(dealBlocker(open({ bundle: forged, verify: keys }))).toEqual(blocked('bundle-invalid'));
+    expect(dealBlocker(open({ bundle: forged }))).toEqual(blocked('bundle-invalid'));
     expect(canDeal(open({ verify: { ...keys, arbiter: makeWorld({ seed: 33 }).arbiter } }))).toBe(
       false,
     );
+  });
+
+  test('the verifier is mandatory: without one the gate stays closed, with its own reason', () => {
+    for (const verify of [
+      undefined,
+      null,
+      'yes',
+      {},
+      { arbiter: w.arbiter },
+      { ...keys, arbiter: 'x' },
+    ]) {
+      expect(dealBlocker(open({ verify })), String(verify)).toEqual(blocked('no-verifier'));
+    }
+    // even when a bundle that merely looks complete is on hand, and even before the first hand
+    expect(canDeal(open({ verify: undefined, head: null, bundle: null }))).toBe(false);
   });
 
   test('the order of the reasons: active, round, members, then the bundle', () => {

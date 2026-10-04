@@ -2,11 +2,13 @@
 // server (arbiter), the web client, the test bots and the watchtower all build, hash, check and verify
 // States with this one package. README.md has the shapes and a worked example.
 export { pokerVaultAbi } from './abi.js';
-export { buildNextState, genesisState, sortRoster } from './build.js';
+export { buildNextState, depositState, epochBaseline, genesisState, sortRoster } from './build.js';
 export {
+  bundleConflict,
   bundleDigest,
   bundleFromWire,
   bundleToWire,
+  EXPECT_ERRORS,
   isNewer,
   makeBundle,
   verifyBundle,
@@ -16,6 +18,7 @@ export {
   checkSettle,
   checkState,
   ERRORS,
+  RAKE_BPS_CEILING,
   STATUS,
   tableFromChain,
 } from './check.js';

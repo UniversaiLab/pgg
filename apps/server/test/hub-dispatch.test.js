@@ -380,6 +380,75 @@ describe('claim', () => {
   });
 });
 
+describe('claim: one table at a time, like join', () => {
+  const alreadySeated = { t: SERVER.ERROR, code: ERR.ALREADY_SEATED, ref: 'claim' };
+
+  test('a player seated at a play table cannot claim a vault table', () => {
+    const vault = new RecordingActor(VAULT_TABLE, { isVault: true });
+    const play = new RecordingActor(PLAY_TABLE);
+    const h = harness({ actors: [vault, play], seatedAt: PLAY_TABLE });
+    h.send(msg.claim);
+    expect(h.ws.sent).toEqual([alreadySeated]);
+    expect(callsOf(vault, play)).toEqual([]);
+    expect(h.ws.data.strikes).toBe(0); // a refusal is not a protocol violation
+  });
+
+  test('nor can a player seated at another vault table', () => {
+    const wanted = new RecordingActor(VAULT_TABLE, { isVault: true });
+    const mine = new RecordingActor('vault-mine', { isVault: true });
+    const h = harness({ actors: [wanted, mine], seatedAt: 'vault-mine' });
+    h.send(msg.claim);
+    expect(h.ws.sent).toEqual([alreadySeated]);
+    expect(callsOf(wanted, mine)).toEqual([]);
+  });
+
+  test('claiming the table they already sit at still goes through, again and again', () => {
+    // A reload or a reconnect proves the same seat again; the actor decides what that means.
+    const vault = new RecordingActor(VAULT_TABLE, { isVault: true });
+    const other = new RecordingActor('vault-2', { isVault: true });
+    const h = harness({ actors: [vault, other], seatedAt: VAULT_TABLE });
+    h.send(msg.claim);
+    h.send(msg.claim);
+    expect(vault.calls.map((c) => c.method)).toEqual(['claim', 'claim']);
+    expect(other.calls).toEqual([]);
+    expect(h.ws.sent).toEqual([]);
+  });
+
+  test('the actor registering the claimer in between makes the next claim a repeat, not a second seat', () => {
+    const vault = new RecordingActor(VAULT_TABLE, { isVault: true });
+    const h = harness({ actors: [vault] });
+    h.send(msg.claim); // not seated anywhere yet
+    h.registry.setSeat(PLAYER.id, VAULT_TABLE); // what the actor's onSeat does on a good claim
+    h.send(msg.claim);
+    expect(vault.calls.map((c) => c.method)).toEqual(['claim', 'claim']);
+    expect(h.ws.sent).toEqual([]);
+  });
+
+  test('once they have left the other table the claim goes through', () => {
+    const vault = new RecordingActor(VAULT_TABLE, { isVault: true });
+    const play = new RecordingActor(PLAY_TABLE);
+    const h = harness({ actors: [vault, play], seatedAt: PLAY_TABLE });
+    h.send(msg.claim);
+    expect(vault.calls).toEqual([]);
+    h.registry.setSeat(PLAYER.id, null);
+    h.send(msg.claim);
+    expect(vault.calls.map((c) => c.method)).toEqual(['claim']);
+    expect(h.errors().map((e) => e.code)).toEqual([ERR.ALREADY_SEATED]);
+  });
+
+  test('a claim for a table that is not a vault table is still not-vault-table, seated or not', () => {
+    // The table is checked first, so the answer never depends on where the sender sits.
+    const play = new RecordingActor(PLAY_TABLE);
+    const other = new RecordingActor('play-2');
+    const h = harness({ actors: [play, other], seatedAt: PLAY_TABLE });
+    h.send({ ...msg.claim, tableId: PLAY_TABLE });
+    h.send({ ...msg.claim, tableId: 'play-2' });
+    h.send({ ...msg.claim, tableId: 'nowhere' });
+    expect(h.errors().map((e) => e.code)).toEqual(Array(3).fill(ERR.NOT_VAULT_TABLE));
+    expect(callsOf(play, other)).toEqual([]);
+  });
+});
+
 describe('sig', () => {
   test('goes to the table the player sits at, never another vault table', () => {
     const mine = new RecordingActor('vault-mine', { isVault: true });
@@ -469,12 +538,22 @@ describe('the existing guards still sit in front of the new messages', () => {
   });
 
   test('the rate limit counts claim and sig', () => {
-    const bucket = new TokenBucket({ capacity: 3, refillPerSec: 0, now: () => 0 });
-    const { actor, h } = vaultHarness({ bucket });
-    for (let i = 0; i < 5; i++) h.send(msg.sig);
-    expect(actor.calls).toHaveLength(3);
-    expect(h.errors().map((e) => e.code)).toEqual([ERR.RATE_LIMITED, ERR.RATE_LIMITED]);
-    expect(h.ws.data.strikes).toBe(2);
+    // Room for exactly three of either (they cost SIGNATURE_COST each), and no refill.
+    for (const type of [CLIENT.CLAIM, CLIENT.SIGN]) {
+      const bucket = new TokenBucket({
+        capacity: 3 * SIGNATURE_COST,
+        refillPerSec: 0,
+        now: () => 0,
+      });
+      const { actor, h } = vaultHarness({ bucket });
+      for (let i = 0; i < 5; i++) h.send(type === CLIENT.CLAIM ? msg.claim : msg.sig);
+      expect(actor.calls, type).toHaveLength(3);
+      expect(
+        h.errors().map((e) => e.code),
+        type,
+      ).toEqual([ERR.RATE_LIMITED, ERR.RATE_LIMITED]);
+      expect(h.ws.data.strikes, type).toBe(2);
+    }
   });
 
   test('a message over the size limit closes the socket, before it is parsed', () => {
@@ -506,6 +585,211 @@ describe('the existing guards still sit in front of the new messages', () => {
     expect(h.ws.closed).toBeNull();
     expect(h.ws.sent).toEqual([]);
     expect(actor.calls.map((c) => c.method)).toEqual(['claim', 'vaultSign']);
+  });
+});
+
+describe('claim and sig cost more rate-limit tokens than anything else', () => {
+  // The default per-connection limit (config.js) and the one the load scripts raise it to.
+  const DEFAULT_LIMIT = { capacity: 40, refillPerSec: 20 };
+  const LOAD_LIMIT = { capacity: 1000, refillPerSec: 1000 };
+
+  /** A bucket that allows everything and only adds up what it was asked for. */
+  const countingBucket = () => {
+    const bucket = {
+      taken: 0,
+      take: (cost = 1) => {
+        bucket.taken += cost;
+        return true;
+      },
+    };
+    return bucket;
+  };
+
+  /** A real bucket on a clock the test moves. */
+  const clockedBucket = (limit) => {
+    const clock = { now: 0 };
+    return { clock, bucket: new TokenBucket({ ...limit, now: () => clock.now }) };
+  };
+
+  const vaultHarness = (bucket) => {
+    const actor = new RecordingActor(VAULT_TABLE, { isVault: true });
+    return { actor, h: harness({ actors: [actor], seatedAt: VAULT_TABLE, bucket }) };
+  };
+
+  const FLOODED = [
+    [CLIENT.CLAIM, msg.claim],
+    [CLIENT.SIGN, msg.sig],
+  ];
+
+  test('the price is set once, is an integer, and is well above a ping', () => {
+    expect(Number.isInteger(SIGNATURE_COST)).toBe(true);
+    // At 5 or more, a socket's burst holds at most 8 of them where it held 40 pings.
+    expect(SIGNATURE_COST).toBeGreaterThanOrEqual(5);
+    // Under the default capacity with room to spare, or a claim and a sig could never both be afforded.
+    expect(SIGNATURE_COST * 2).toBeLessThanOrEqual(DEFAULT_LIMIT.capacity);
+  });
+
+  test('the configured limits are the ones this arithmetic assumes', () => {
+    expect(loadConfig({}).rateLimit).toEqual(DEFAULT_LIMIT);
+    // What loadtest.js and bots.js set (RATE_CAPACITY, RATE_REFILL).
+    expect(loadConfig({ RATE_CAPACITY: '1000', RATE_REFILL: '1000' }).rateLimit).toEqual(
+      LOAD_LIMIT,
+    );
+  });
+
+  test('every message type is charged its price, and only claim and sig pay extra', () => {
+    for (const type of Object.values(CLIENT)) {
+      const sample = SAMPLES[type];
+      const bucket = countingBucket();
+      const actor = new RecordingActor(VAULT_TABLE, { isVault: true });
+      const h = harness({
+        actors: [actor],
+        seatedAt: sample.seated ? VAULT_TABLE : null,
+        bucket,
+      });
+      h.send(sample.message);
+      const expected = type === CLIENT.CLAIM || type === CLIENT.SIGN ? SIGNATURE_COST : 1;
+      expect(bucket.taken, type).toBe(expected);
+    }
+  });
+
+  test('the same prices apply at a play table', () => {
+    for (const type of Object.values(CLIENT)) {
+      const sample = PLAY_SAMPLES[type];
+      const bucket = countingBucket();
+      const h = harness({
+        actors: [new RecordingActor(PLAY_TABLE)],
+        seatedAt: sample.seated ? PLAY_TABLE : null,
+        bucket,
+      });
+      h.send(sample.message);
+      const expected = type === CLIENT.CLAIM || type === CLIENT.SIGN ? SIGNATURE_COST : 1;
+      expect(bucket.taken, type).toBe(expected);
+    }
+  });
+
+  test('a malformed claim or sig costs one token: nothing is recovered for it', () => {
+    const bucket = countingBucket();
+    const { h } = vaultHarness(bucket);
+    h.send({ ...msg.claim, sig: SIGNATURE.slice(0, -2) });
+    h.send({ ...msg.sig, nonce: 12 });
+    h.sendRaw('{"t":"sig"');
+    h.sendRaw('not json');
+    expect(bucket.taken).toBe(4);
+  });
+
+  for (const [type, message] of FLOODED) {
+    test(`a flood of ${type} is rate limited after a few, then the sender is disconnected`, () => {
+      const { bucket } = clockedBucket(DEFAULT_LIMIT);
+      const { actor, h } = vaultHarness(bucket);
+      const affordable = Math.floor(DEFAULT_LIMIT.capacity / SIGNATURE_COST);
+      expect(affordable).toBeLessThanOrEqual(8);
+
+      for (let i = 0; i < affordable; i++) h.send(message);
+      expect(actor.calls).toHaveLength(affordable);
+      expect(h.errors()).toEqual([]);
+
+      // The next ones are refused with the existing strike logic: seven strikes are tolerated...
+      for (let i = 1; i <= 7; i++) {
+        h.send(message);
+        expect(h.ws.data.strikes).toBe(i);
+        expect(h.ws.closed).toBeNull();
+      }
+      expect(h.errors().map((e) => e.code)).toEqual(Array(7).fill(ERR.RATE_LIMITED));
+      // ...and the eighth closes the socket with the rate-limit code.
+      h.send(message);
+      expect(h.ws.closed?.code).toBe(CLOSE.RATE_LIMITED);
+      expect(actor.calls).toHaveLength(affordable); // none of the flood reached the actor
+    });
+
+    test(`${type} is paid for out of the same bucket, so waiting restores it`, () => {
+      const { clock, bucket } = clockedBucket(DEFAULT_LIMIT);
+      const { actor, h } = vaultHarness(bucket);
+      const affordable = Math.floor(DEFAULT_LIMIT.capacity / SIGNATURE_COST);
+      for (let i = 0; i < affordable; i++) h.send(message);
+      const waitMs = (SIGNATURE_COST / DEFAULT_LIMIT.refillPerSec) * 1000;
+
+      clock.now += waitMs - 100; // not yet a whole price
+      h.send(message);
+      expect(actor.calls).toHaveLength(affordable);
+      expect(h.errors()).toHaveLength(1);
+
+      clock.now += 200; // now past it, even counting the token the refused try still cost
+      h.send(message);
+      expect(actor.calls).toHaveLength(affordable + 1);
+    });
+  }
+
+  test('a flood of valid claims or sigs does not push the price onto other connections', () => {
+    // Each socket has its own bucket: one connection being limited changes nothing for another.
+    const flooded = clockedBucket(DEFAULT_LIMIT);
+    const calm = clockedBucket(DEFAULT_LIMIT);
+    const a = vaultHarness(flooded.bucket);
+    const b = vaultHarness(calm.bucket);
+    for (let i = 0; i < 30; i++) a.h.send(msg.sig);
+    b.h.send(msg.sig);
+    expect(b.h.errors()).toEqual([]);
+    expect(b.actor.calls).toHaveLength(1);
+  });
+
+  test('act, seed and ping are not slowed: a full burst of 40 each still goes through', () => {
+    for (const type of [CLIENT.ACT, CLIENT.SEED, CLIENT.PING, CLIENT.SYNC, CLIENT.BACK]) {
+      const { bucket } = clockedBucket(DEFAULT_LIMIT);
+      const { h } = vaultHarness(bucket);
+      for (let i = 0; i < DEFAULT_LIMIT.capacity; i++) h.send(SAMPLES[type].message);
+      expect(h.errors(), type).toEqual([]);
+      expect(h.ws.data.strikes, type).toBe(0);
+      h.send(SAMPLES[type].message); // one more than the burst
+      expect(
+        h.errors().map((e) => e.code),
+        type,
+      ).toEqual([ERR.RATE_LIMITED]);
+    }
+  });
+
+  test('play messages cost what they always cost, so what is left buys exactly one signature', () => {
+    const { bucket } = clockedBucket(DEFAULT_LIMIT);
+    const { actor, h } = vaultHarness(bucket);
+    for (let i = 0; i < DEFAULT_LIMIT.capacity - SIGNATURE_COST; i++) h.send(msg.act);
+    h.send(msg.sig);
+    expect(h.errors()).toEqual([]);
+    h.send(msg.sig);
+    expect(h.errors().map((e) => e.code)).toEqual([ERR.RATE_LIMITED]);
+    expect(actor.calls.filter((c) => c.method === 'vaultSign')).toHaveLength(1);
+  });
+
+  test('an honest client is never limited: a claim and a sync on connect, then a signature every hand', () => {
+    const { clock, bucket } = clockedBucket(DEFAULT_LIMIT);
+    const { actor, h } = vaultHarness(bucket);
+    // Back to back on connect, then the pending signreq's answer straight after.
+    h.send(msg.claim);
+    h.send(msg.sync);
+    h.send(msg.sig);
+    // Ten minutes of 3 second hands: a signature, three actions and a seed, and a ping every 5 seconds.
+    for (let hand = 0; hand < 200; hand++) {
+      clock.now = hand * 3000;
+      h.send(msg.sig);
+      for (const type of [CLIENT.ACT, CLIENT.ACT, CLIENT.ACT, CLIENT.SEED]) {
+        clock.now += 400;
+        h.send(SAMPLES[type].message);
+      }
+      if (hand % 5 === 0) h.send(msg.ping);
+    }
+    expect(h.errors()).toEqual([]);
+    expect(h.ws.data.strikes).toBe(0);
+    expect(h.ws.closed).toBeNull();
+    expect(actor.calls.filter((c) => c.method === 'vaultSign')).toHaveLength(201);
+  });
+
+  test('the limits the load scripts use leave room for signing bots', () => {
+    const { bucket } = clockedBucket(LOAD_LIMIT);
+    const { actor, h } = vaultHarness(bucket);
+    for (let i = 0; i < 50; i++) {
+      h.send(msg.claim);
+      h.send(msg.sig);
+    }
+    expect(h.errors()).toEqual([]);
+    expect(actor.calls).toHaveLength(100);
   });
 });
 
@@ -552,5 +836,105 @@ describe('play-money messages are unchanged', () => {
     h.send(msg.sync);
     expect(play.calls.map((c) => c.method)).toEqual(['act', 'sync']);
     expect(h.ws.sent).toEqual([]);
+  });
+});
+
+describe('the scripted test client runs onMessageHook after logging and validating', () => {
+  // The Bot opens `new WebSocket(...)`; this stands in for it, so nothing listens on a port.
+  class FakeWebSocket {
+    static OPEN = 1;
+    static last = null;
+    readyState = 1;
+    constructor(url) {
+      this.url = url;
+      FakeWebSocket.last = this;
+    }
+    send() {}
+    close() {}
+  }
+
+  /** A connected bot over the fake socket; `deliver` hands it a message as if the server sent it. */
+  async function withBot(run) {
+    const real = globalThis.WebSocket;
+    globalThis.WebSocket = FakeWebSocket;
+    try {
+      const bot = new Bot({ httpUrl: 'http://x', wsUrl: 'ws://x', name: 'tester' });
+      const connecting = bot.connect();
+      FakeWebSocket.last.onopen();
+      await connecting;
+      const deliver = (message) => FakeWebSocket.last.onmessage({ data: JSON.stringify(message) });
+      await run(bot, deliver);
+    } finally {
+      globalThis.WebSocket = real;
+    }
+  }
+
+  const GOOD = { t: SERVER.BALANCE, balance: 77 };
+  const BAD = { t: SERVER.BALANCE, balance: 'lots' }; // fails the schema
+
+  test('the hook sees the message already logged, and already marked invalid when it is', async () => {
+    await withBot((bot, deliver) => {
+      const seen = [];
+      bot.onMessageHook = (msg) =>
+        seen.push({
+          logged: bot.log.at(-1) === msg,
+          logLength: bot.log.length,
+          invalid: bot.invalid.length,
+        });
+      deliver(GOOD);
+      deliver(BAD);
+      expect(seen).toEqual([
+        { logged: true, logLength: 1, invalid: 0 },
+        { logged: true, logLength: 2, invalid: 1 },
+      ]);
+    });
+  });
+
+  test('the hook gets every message once, in order', async () => {
+    await withBot((bot, deliver) => {
+      const seen = [];
+      bot.onMessageHook = (msg) => seen.push(msg);
+      for (const message of [GOOD, { t: SERVER.PONG, now: 1 }, BAD]) deliver(message);
+      expect(seen).toEqual([GOOD, { t: SERVER.PONG, now: 1 }, BAD]);
+      expect(bot.log).toEqual(seen);
+    });
+  });
+
+  test('a hook that throws cannot drop a message, skip validation or stop the bot handling it', async () => {
+    await withBot((bot, deliver) => {
+      bot.onMessageHook = (msg) => {
+        throw new Error(`hook failed on ${msg.t}`);
+      };
+      expect(() => deliver(BAD)).not.toThrow(); // what the socket's own handler would see
+      expect(() => deliver(GOOD)).not.toThrow();
+      expect(bot.log).toEqual([BAD, GOOD]);
+      expect(bot.invalid.map((entry) => entry.msg)).toEqual([BAD]); // checked before the hook ran
+      expect(bot.balance).toBe(77); // the bot's own handling still ran
+      expect(bot.hookErrors.map((entry) => [entry.msg, entry.error.message])).toEqual([
+        [BAD, 'hook failed on balance'],
+        [GOOD, 'hook failed on balance'],
+      ]);
+    });
+  });
+
+  test('a hook that rejects is recorded too, not left as an unhandled rejection', async () => {
+    await withBot(async (bot, deliver) => {
+      bot.onMessageHook = async () => {
+        throw new Error('async failure');
+      };
+      deliver(GOOD);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(bot.log).toEqual([GOOD]);
+      expect(bot.hookErrors.map((entry) => entry.error.message)).toEqual(['async failure']);
+    });
+  });
+
+  test('without a hook nothing changes', async () => {
+    await withBot((bot, deliver) => {
+      deliver(GOOD);
+      expect(bot.log).toEqual([GOOD]);
+      expect(bot.hookErrors).toEqual([]);
+    });
   });
 });

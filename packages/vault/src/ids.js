@@ -6,7 +6,7 @@
 //            and is player `playerId`". The server checks it against seats(tableKey, address).sessionKey.
 //            It is the stand-in for wallet sign-in until SIWE exists. It is not an EIP-712 message on
 //            purpose: it can never be mistaken for a State digest (those start with 0x1901).
-import { concat, keccakHex, uintWord, utf8 } from './bytes.js';
+import { concat, isWellFormed, keccakHex, uintWord, utf8 } from './bytes.js';
 import { normalizeDomain } from './eip712.js';
 import { fromHex, recoverSigner, signDigest } from './sign.js';
 import { normalizeAddress } from './state.js';
@@ -20,6 +20,8 @@ export function tableKeyFor({ chainId, vault, serverId, generation }) {
   if (typeof serverId !== 'string' || serverId === '' || serverId.includes(':')) {
     throw new RangeError('serverId must be a non-empty string without ":"');
   }
+  // a lone surrogate would be encoded as U+FFFD, so different ids would share one table key
+  if (!isWellFormed(serverId)) throw new RangeError('serverId must be well-formed Unicode');
   const whole = typeof generation === 'bigint' || Number.isSafeInteger(generation);
   if (!whole || generation < 0) throw new RangeError('generation must be a non-negative integer');
   return keccakHex(
@@ -40,6 +42,7 @@ export function claimDigest({ domain, tableKey, address, playerId }) {
   if (typeof playerId !== 'string' || playerId === '') {
     throw new RangeError('playerId must be a non-empty string');
   }
+  if (!isWellFormed(playerId)) throw new RangeError('playerId must be well-formed Unicode');
   return keccakHex(
     concat([
       utf8(CLAIM_PREFIX),
@@ -62,5 +65,5 @@ export const recoverClaim = (claim, signature) => recoverSigner(claimDigest(clai
 /** True when `signature` is a claim signature by `sessionKey` (the seat's on-chain session key). */
 export function verifyClaim(claim, signature, sessionKey) {
   const signer = recoverClaim(claim, signature);
-  return signer !== null && sessionKey != null && signer === sessionKey.toLowerCase();
+  return signer !== null && typeof sessionKey === 'string' && signer === sessionKey.toLowerCase();
 }
