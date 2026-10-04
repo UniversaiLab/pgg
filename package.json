@@ -11,8 +11,8 @@
   ],
   "scripts": {
     "dev:server": "bun --hot apps/server/src/index.js",
-    "dev:web": "bun --cwd apps/web run dev",
-    "build:web": "bun --cwd apps/web run build",
+    "dev:web": "cd apps/web && bun run dev",
+    "build:web": "cd apps/web && bun run build",
     "test": "bun test ./apps ./packages",
     "test:contracts": "cd contracts && forge test",
     "build:contracts": "cd contracts && forge build",
