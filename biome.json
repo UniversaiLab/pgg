@@ -8,6 +8,8 @@
       "!contracts/lib",
       "!contracts/out",
       "!contracts/cache",
+      "!contracts/broadcast",
+      "!contracts/test/vectors",
       "!bun.lock"
     ]
   },

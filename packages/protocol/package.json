@@ -10,5 +10,8 @@
   },
   "dependencies": {
     "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "viem": "^2.57.2"
   }
 }

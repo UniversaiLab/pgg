@@ -153,7 +153,34 @@ Known limits at higher scale: the lobby list is sent whole (45 KB at 300 tables)
 broadcast to unseated players, and needs pagination or deltas well before thousands of tables; and
 state is in memory, so a restart (or a watchdog kill) loses hands in flight.
 
+## Escrow contract (`contracts/`)
+
+`PokerVault.sol` is a non-custodial escrow: one deployment holds one ERC-20 on one chain (USDC on
+Polygon, USDT on BSC). The game stays off-chain; the chain only guards the money.
+
+- **Signed state.** Every hand produces an EIP-712 `State` signed by the server (the *arbiter*) and by
+  **every player's session key**. The contract checks the signatures, that the roster is exactly the
+  seated players, that `sum(balances) + rake == escrow` to the last unit, and that the nonce is higher
+  than anything seen. It never evaluates poker.
+- **Closing.** A state marked `isFinal` pays out at once and lets players `keep` their chips for the next
+  epoch (join/leave/top up happen between epochs). Any other signed state must go through a time-locked
+  dispute (`startExit`, `challenge`, `finalizeExit`), so a player holding an old state cannot cash it in.
+- **Not custodial.** The owner can only pause new money and rotate the arbiter; the arbiter alone cannot
+  pay anybody. Withdrawing is never paused. A recipient the token refuses cannot block a settlement.
+- **Session keys** are registered at deposit time and have no on-chain expiry (see the trust model for
+  why: an expiry that gates settlement would help a losing player stall).
+- **Same code on both chains.** BSC is a second deployment with USDT; tables are per chain.
+
+The signed-state typed data is shared with the clients in `packages/protocol/src/vault.js` and is
+checked against the contract with real viem signatures.
+
+The honest summary of what this does not give you (the dealing is server-side, a losing player can refuse
+to sign and roll back one hand, someone must answer bad exits in time) is in
+[trust-model.md](trust-model.md). The contract is **unaudited**.
+
 ## Status
 
-Milestone 1 (engine, server, mobile UI, play-money) is complete. Milestone 2: Foundry vault, session keys,
-cashier, indexer (Polygon Amoy, BSC testnet). Milestone 3: scale hardening, audit prep.
+Milestone 1 (engine, server, mobile UI, play-money) is complete. Milestone 2 has its core: the `PokerVault`
+escrow with its tests and trust model. Still to do in Milestone 2: the signing layer in the server and web
+client (session keys, per-hand signatures, the watchtower), the cashier and chain indexer, wallet connection,
+and deployment on Polygon Amoy and BSC testnet. Milestone 3: scale hardening, audit prep.

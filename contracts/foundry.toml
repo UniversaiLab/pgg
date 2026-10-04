@@ -1,0 +1,27 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.28"
+# OpenZeppelin 5.6 uses MCOPY, so this needs Cancun. Checked in the node sources (bor, bsc master):
+# Polygon PoS (block 54,876,000), Amoy (5,423,600), BSC (June 2024) and BSC testnet all enable it.
+# Re-check before each mainnet deployment.
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+remappings = [
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "forge-std/=lib/forge-std/src/",
+]
+fs_permissions = [{ access = "read", path = "./test/vectors" }]
+
+[fuzz]
+runs = 1000
+
+[invariant]
+runs = 256
+depth = 120
+fail_on_revert = false

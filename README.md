@@ -4,7 +4,7 @@ Mobile-only Web3 poker. Players join Texas Hold'em tables from a phone browser; 
 on a fast Bun server, and (Milestone 2) money sits in a non-custodial escrow contract.
 
 Derived from [pok3rNetwork/pok3r](https://github.com/pok3rNetwork/pok3r) (MIT), see [NOTICE](NOTICE).
-Plain JavaScript (ES modules) everywhere; only the contracts will be Solidity.
+Plain JavaScript (ES modules) everywhere; only the contracts are Solidity.
 
 <p>
   <img src="docs/screenshots/lobby.webp" width="23%" alt="Lobby">
@@ -18,19 +18,24 @@ Plain JavaScript (ES modules) everywhere; only the contracts will be Solidity.
 **Milestone 1 (play-money vertical slice) is done.** You can open the app on a phone, pick a table, and
 play full hands against other people or bots, with a verifiable shuffle for every hand.
 
-**There is no real-money path yet, and none will be enabled** before an independent contract audit and
-legal review. Milestone 2 is the Foundry escrow, wallet connection, session keys and deposits (Polygon,
-BSC); Milestone 3 is scale-out and audit prep. See [docs/architecture.md](docs/architecture.md).
+**Milestone 2 has started.** The `PokerVault` escrow contract (Foundry, 85 tests) is written and tested,
+and its signed-state format is shared with the JS side and checked against real viem signatures. It is
+not connected to the app yet: the signing layer, cashier/indexer and wallet connection come next, then
+deployment on Polygon Amoy and BSC testnet.
+
+**There is no real-money path, and none will be enabled** before an independent contract audit, legal
+review and RNG review. The contract's limits are written down in [docs/trust-model.md](docs/trust-model.md);
+the design is in [docs/architecture.md](docs/architecture.md).
 
 ## Layout
 
 | Path | What |
 | --- | --- |
 | `packages/engine` | Hold'em table (betting via `poker-ts`), our own settlement, commit-reveal dealer, rake. Only `@pgg/engine/fairness` is browser-safe. |
-| `packages/protocol` | zod schemas for every client-server message; `./constants` is dependency-free for the web. |
+| `packages/protocol` | zod schemas for every client-server message; `./constants` is dependency-free for the web; `./src/vault.js` is the escrow's signed-state typed data. |
 | `apps/server` | Hono + Bun WebSocket game server, load-test and bot tooling. |
 | `apps/web` | Mobile-only React client (Vite, Tailwind, motion). Desktop gets a QR code. |
-| `contracts/` | Foundry escrow (Milestone 2). |
+| `contracts/` | Foundry project: the `PokerVault` escrow. See [contracts/README.md](contracts/README.md). |
 | `docs/` | Architecture, measured capacity, `poker-ts` findings. |
 
 ## Run it
@@ -54,7 +59,8 @@ phone-sized touch mode.
 ## Check it
 
 ```sh
-bun test                        # engine, server (incl. real WebSocket end-to-end) and web logic
+bun test ./apps ./packages      # engine, server (incl. real WebSocket end-to-end), web logic, protocol
+bun run test:contracts          # Foundry: 85 tests for the escrow (needs forge, see contracts/README.md)
 bun run lint
 bun run size                    # initial download budget (after build:web)
 bun run shots                   # drives a phone-sized Chromium through the whole app and saves screenshots
