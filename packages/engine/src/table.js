@@ -109,14 +109,17 @@ export class PokerTable {
   }
 
   /**
-   * Every chip at the table: stacks, bets on the felt, and pots already collected. Constant
-   * between hands and throughout one (rake leaves only at settlement), which makes it the thing
-   * to assert on after every action.
+   * Every chip at this table, including the ones in play. Constant between hands and throughout one
+   * (rake leaves only at settlement), so it is the thing to assert on after every action.
+   *
+   * Stacks are untouched while a hand runs (poker-ts holds the in-hand chips), so this is simply their
+   * sum. It is deliberately not read from poker-ts's seats and pots: after a fold on a later street
+   * poker-ts parks the folder's bet where neither `seats()` nor `pots()` shows it until the betting
+   * round is collected. poker-ts's own books are cross-checked where they are complete, at the end of
+   * every betting round (`#checkCollected`) and again at settlement.
    */
   totalChips() {
-    if (!this.#inHand) return sum(this.#stacks.map((chips) => chips ?? 0));
-    const held = sum(this.#poker.seats().map((player) => (player ? player.totalChips : 0)));
-    return held + sum(this.#poker.pots().map((pot) => pot.size));
+    return sum(this.#stacks.map((chips) => chips ?? 0));
   }
 
   /** Chips held by a seat (not counting bets already on the felt), or null if the seat is empty. */
@@ -326,6 +329,7 @@ export class PokerTable {
     const poker = this.#poker;
     while (poker.isHandInProgress() && !poker.isBettingRoundInProgress()) {
       poker.endBettingRound();
+      this.#checkCollected();
       const board = poker.communityCards();
       if (board.length > this.#boardLength) {
         this.#boardLength = board.length;
@@ -339,6 +343,24 @@ export class PokerTable {
         this.#settle();
         return;
       }
+    }
+  }
+
+  // Everything each seat has put in so far this hand: the stack it started with less what it still
+  // holds (stacks only fall during betting). This is exact at every moment, which poker-ts's own
+  // pots and bets are not: a folded bet is parked out of sight until the round is collected.
+  #contributions(players) {
+    return players.map((player, seat) => (player ? this.#startStacks[seat] - player.stack : 0));
+  }
+
+  // Between betting rounds every bet has been collected, so poker-ts's books must add up exactly.
+  // If they do not, something is wrong inside poker-ts and the caller aborts and refunds the hand.
+  #checkCollected() {
+    const poker = this.#poker;
+    const held = sum(poker.seats().map((player) => (player ? player.totalChips : 0)));
+    const pots = sum(poker.pots().map((pot) => pot.size));
+    if (held + pots !== sum(this.#startStacks)) {
+      throw new Error('poker-ts chip accounting broke between betting rounds');
     }
   }
 
@@ -372,10 +394,7 @@ export class PokerTable {
     const holeCards = poker.holeCards();
     const button = poker.button();
 
-    // Everything a seat has put in so far (stacks only fall during betting; bets are collected).
-    const contributions = before.map((player, seat) =>
-      player ? this.#startStacks[seat] - player.stack : 0,
-    );
+    const contributions = this.#contributions(before);
     const potTotal = sum(contributions);
     if (potTotal !== sum(poker.pots().map((pot) => pot.size))) {
       throw new Error('contribution accounting disagrees with poker-ts pots');
@@ -491,9 +510,7 @@ export class PokerTable {
       toAct,
       round: inHand ? poker.roundOfBetting() : null,
       board: inHand ? poker.communityCards().map(fromFacade) : (this.#lastHand?.result.board ?? []),
-      pot: inHand
-        ? sum(poker.pots().map((pot) => pot.size)) + sum(players.map((p) => (p ? p.betSize : 0)))
-        : 0,
+      pot: inHand ? sum(this.#contributions(players)) : 0,
       seats,
       legal,
     };

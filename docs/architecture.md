@@ -21,7 +21,8 @@ Replaced, and why (from reading the upstream source):
 
 ## poker-ts 1.5.0: what we do not trust
 
-Fuzzing and load-testing `PokerTable` against `poker-ts` found five defects. Each has a regression test.
+Fuzzing and load-testing `PokerTable` against `poker-ts` found five defects, and a sixth quirk that only
+affects what is displayed. Each has a regression test.
 
 1. **Lost payout.** The dealer nulls all-in players in its internal player list and the payout loop
    skips nulls, so a short-stack all-in player who *wins* is never paid and is then removed as
@@ -40,6 +41,17 @@ Fuzzing and load-testing `PokerTable` against `poker-ts` found five defects. Eac
    `NaN`, which never reaches zero. A server running `showdown()` froze once under load at 100% CPU
    with a constant memory footprint (a tight loop in JIT-compiled JS, seen with `gdb`). The exact
    input was **not** reproduced, so this is the leading suspect, not a proven cause.
+6. **Folded bets vanish from view until the round is collected.** After a fold on the flop, turn or
+   river, poker-ts moves the folder's bet into a private aggregate that neither `seats()` nor `pots()`
+   reports until the betting round ends (and after a *preflop* fold it leaves the chips on the player
+   instead). When a player folds to a raise while someone else still has to act, anything computed from
+   poker-ts's seats and pots is short by the folded bet until the next action: the pot shown to players
+   shrank and then jumped back, and our own "total chips" check read low. Payouts were never affected,
+   since settlement works from what each seat has put in. This surfaced only in a CI run: the server's
+   random-play test failed 36 times in 400 (about one engine-fuzz hand in 3,000 hits it, but that test
+   re-raises with large amounts). The displayed pot and `totalChips()` are now computed from each seat's
+   contribution (start-of-hand stack minus current stack), which is exact at every moment, and poker-ts's
+   own books are cross-checked where they are complete, at the end of every betting round.
 
 Design response, all in `packages/engine`:
 
@@ -52,14 +64,19 @@ Design response, all in `packages/engine`:
   covered by the fairness proof.
 - `pokersolver` is validated against a brute-force reference evaluator (`test/reference-eval.js`):
   5,000 random showdowns, hand-picked edge cases, and every pot of the fuzz run.
-- Chip conservation is asserted on every hand **and after every single action**.
+- Chip conservation is asserted on every hand. Mid-hand, the table total is exact by construction (stacks are
+  untouched while a hand runs) and poker-ts's seats-plus-pots total is cross-checked at the end of every
+  betting round, when all bets are collected; a mismatch aborts and refunds the hand (see defect 6 for why
+  this is not done after every single action).
 - If any invariant ever fails, the table actor **aborts the hand and refunds everyone** instead of
   guessing, logs it, and keeps running (`abortHand`, `TableActor.#recover`).
 - The server runs a **watchdog thread** that kills the process if its event loop stalls for 10 s, so a
   wedged process is restarted by its supervisor instead of silently serving nobody.
 
-Evidence: five seeds of 8,000 hands each (`FUZZ_HANDS=8000 FUZZ_SEED=... bun test -t fuzz`), and nine
-deliberate mutations of the engine and actor, are all caught by the test suite.
+Evidence: five seeds of 10,000 hands each (`FUZZ_HANDS=10000 FUZZ_SEED=1..5 bun test packages/engine -t fuzz`)
+pass with every cross-check active, and deliberate mutations of the engine and actor are caught by the
+test suite. (An earlier version of this paragraph quoted a similar run from before the check described in
+defect 6 existed; it is replaced by the run above.)
 
 If `poker-ts` is upgraded, the regression tests show whether these are fixed. Because it is now used
 only for betting, replacing it entirely is a small, well-bounded job.

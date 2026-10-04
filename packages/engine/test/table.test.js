@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import Poker from 'poker-ts';
 import { CommitRevealDealer } from '../src/dealer.js';
 import { CANONICAL_DECK, deriveDeck, verifyHand } from '../src/fairness.js';
 import { IllegalActionError, PokerTable } from '../src/table.js';
@@ -623,4 +624,89 @@ describe('fuzz: random legal play', () => {
       );
     }
   }, 600_000); // long runs (FUZZ_HANDS) are synchronous; the default 5s timeout would flag them
+});
+
+describe('chips on the felt mid-hand', () => {
+  // poker-ts parks the bet of a player who folds on the flop, turn or river until that betting round is
+  // collected. A fold to a raise while another player still has to act therefore used to make those chips
+  // vanish from totalChips() and from the pot shown to players, and bring them back one action later.
+  // Settlement was never affected (it works from what each seat has put in).
+  const toFlop = (table) => {
+    table.startHand({ deck: [...CANONICAL_DECK], handNo: 1 });
+    for (let i = 0; i < 3; i++) {
+      const seat = table.snapshot(null).toAct;
+      table.act(seat, table.snapshot(seat).legal.actions.includes('check') ? 'check' : 'call');
+    }
+    expect(table.snapshot(null).round).toBe('flop');
+  };
+
+  test('a player who folds to a re-raise on the flop leaves their bet in the pot while others still act', () => {
+    const table = threeHanded();
+    toFlop(table);
+    const total = table.totalChips();
+    expect(total).toBe(3000);
+    expect(table.snapshot(null).pot).toBe(300);
+
+    const step = (action, amount) => {
+      const seat = table.snapshot(null).toAct;
+      table.act(seat, action, amount);
+      expect(table.totalChips(), `chips after ${action}`).toBe(total);
+      return seat;
+    };
+
+    const folder = step('bet', 100); // 100 in
+    step('call'); // 100 in
+    step('raise', 400); // third player re-raises: 400 in
+    expect(table.snapshot(null).pot).toBe(300 + 100 + 100 + 400);
+    expect(table.snapshot(null).toAct).toBe(folder);
+
+    step('fold'); // the folder's 100 is dead money, and one player has yet to answer
+    const after = table.snapshot(null);
+    expect(after.inHand).toBe(true);
+    expect(after.seats[folder].folded).toBe(true);
+    expect(after.pot, 'the folded 100 is still in the pot').toBe(300 + 100 + 100 + 400);
+
+    step('call'); // round over: everything is collected
+    expect(table.snapshot(null).pot).toBe(300 + 100 + 400 + 400);
+    playOut(table);
+    expect(table.lastHand().result.stacks.reduce((a, b) => a + b, 0)).toBe(3000);
+  });
+
+  test('the pot shown to players never shrinks during a hand', () => {
+    const table = threeHanded({}, [1000, 1000, 400]);
+    table.startHand({ deck: [...CANONICAL_DECK], handNo: 1 });
+    let last = 0;
+    for (let guard = 0; table.inHand; guard++) {
+      expect(guard).toBeLessThan(100);
+      const seat = table.snapshot(null).toAct;
+      const legal = table.snapshot(seat).legal;
+      // raise whenever possible, then fold to the next raise: folds with chips already in
+      const action = legal.toCall > 0 && guard % 3 === 2 ? 'fold' : aggressive(legal)[0];
+      const amount = action === 'raise' || action === 'bet' ? legal.max : undefined;
+      table.act(seat, action, amount);
+      if (table.inHand) {
+        const pot = table.snapshot(null).pot;
+        expect(pot, `pot after ${action} by seat ${seat}`).toBeGreaterThanOrEqual(last);
+        last = pot;
+        expect(table.totalChips()).toBe(2400);
+      }
+    }
+  });
+  test('poker-ts books that stop adding up are refused as soon as the betting round is collected', () => {
+    const table = threeHanded();
+    const original = Poker.Table.prototype.endBettingRound;
+    // simulate a poker-ts defect: five chips appear in the main pot when the round is collected.
+    // Patched before the hand starts, because the engine builds its poker-ts table in startHand.
+    Poker.Table.prototype.endBettingRound = function (...args) {
+      const result = original.apply(this, args);
+      this._table._dealer._potManager.pots()[0].add(5); // the public pots() hands out copies
+      return result;
+    };
+    try {
+      table.startHand({ deck: [...CANONICAL_DECK], handNo: 1 });
+      expect(() => playOut(table)).toThrow(/chip accounting broke/);
+    } finally {
+      Poker.Table.prototype.endBettingRound = original;
+    }
+  });
 });
