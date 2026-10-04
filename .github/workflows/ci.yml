@@ -34,3 +34,16 @@ jobs:
       - run: forge fmt --check
       - run: forge build
       - run: forge test
+      # Chain tests deploy the real contracts to a local anvil. They skip on the plain `check` job (no
+      # Foundry there); here a missing prerequisite is a failure.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install JS dependencies
+        working-directory: .
+        run: bun install --frozen-lockfile
+      - name: Chain tests against a local anvil
+        working-directory: .
+        env:
+          PGG_REQUIRE_CHAIN_TESTS: '1'
+        run: bun test ./packages/vault

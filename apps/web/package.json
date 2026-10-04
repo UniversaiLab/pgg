@@ -15,7 +15,8 @@
     "motion": "^14.0.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "@pgg/vault": "workspace:*"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

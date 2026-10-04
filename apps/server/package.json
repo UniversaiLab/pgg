@@ -8,7 +8,9 @@
     "@pgg/engine": "workspace:*",
     "@pgg/protocol": "workspace:*",
     "hono": "^4.13.13",
-    "@noble/hashes": "^2.4.0"
+    "@noble/hashes": "^2.4.0",
+    "@pgg/vault": "workspace:*",
+    "viem": "^2.57.2"
   },
   "scripts": {
     "start": "bun src/index.js",

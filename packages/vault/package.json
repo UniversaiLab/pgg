@@ -1,0 +1,19 @@
+{
+  "name": "@pgg/vault",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Signing layer for PokerVault: EIP-712 state hashing, session-key signatures, state building and checking, bundles, and the client/server rules. Browser-safe; no viem.",
+  "exports": {
+    ".": "./src/index.js",
+    "./testing": "./testing/index.js"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "@pgg/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "viem": "^2.57.2"
+  }
+}
