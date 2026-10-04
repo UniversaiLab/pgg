@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { recoverTypedDataAddress } from 'viem';
 import { buildVector, STATE_TYPE_STRING, VECTOR_PATH } from '../scripts/vault-vector.js';
-import { stateMessage, stateTypedData, VAULT_NAME } from '../src/vault.js';
+import { STATE_TYPES, stateMessage, stateTypedData, VAULT_NAME } from '../src/vault.js';
 
 const A = '0x0000000000000000000000000000000000000001';
 const B = '0x0000000000000000000000000000000000000002';
@@ -47,6 +47,63 @@ describe('vault typed data', () => {
       verifyingContract: A,
     });
     expect(t.primaryType).toBe('State');
+  });
+});
+
+describe('STATE_TYPES is frozen all the way down', () => {
+  // @pgg/vault computes STATE_TYPEHASH from this once and reads the live object when it encodes a state.
+  // Anything that changed it after that would leave the two disagreeing, and every digest wrong.
+  test('the object, the field list and every field are frozen', () => {
+    expect(Object.isFrozen(STATE_TYPES)).toBe(true);
+    expect(Object.isFrozen(STATE_TYPES.State)).toBe(true);
+    expect(STATE_TYPES.State).toHaveLength(8);
+    for (const field of STATE_TYPES.State) expect(Object.isFrozen(field)).toBe(true);
+  });
+
+  test('every way of changing it throws, and the content is the same afterwards', () => {
+    const before = JSON.stringify(STATE_TYPES);
+    const attempts = [
+      () => STATE_TYPES.State.push({ name: 'extra', type: 'bool' }),
+      () => STATE_TYPES.State.pop(),
+      () => STATE_TYPES.State.reverse(),
+      () => STATE_TYPES.State.sort(),
+      () => STATE_TYPES.State.splice(0, 1),
+      () => {
+        STATE_TYPES.State.length = 0;
+      },
+      () => {
+        STATE_TYPES.State[0] = { name: 'x', type: 'bool' };
+      },
+      () => {
+        STATE_TYPES.State[0].type = 'bytes32[]';
+      },
+      () => {
+        STATE_TYPES.State[1].name = 'other';
+      },
+      () => {
+        delete STATE_TYPES.State[2].name;
+      },
+      () => {
+        STATE_TYPES.Other = [];
+      },
+      () => {
+        delete STATE_TYPES.State;
+      },
+      () => {
+        STATE_TYPES.State = [];
+      },
+    ];
+    for (const attempt of attempts) expect(attempt).toThrow(TypeError);
+    expect(JSON.stringify(STATE_TYPES)).toBe(before);
+  });
+
+  test('stateTypedData hands out the frozen object, and viem still reads it', async () => {
+    const typed = stateTypedData(state(), { chainId: 137, verifyingContract: A });
+    expect(typed.types).toBe(STATE_TYPES);
+    expect(Object.isFrozen(typed.types.State)).toBe(true);
+    // The existing signature tests above prove viem hashes it; this one proves it does not try to edit it.
+    const { hashTypedData } = await import('viem');
+    expect(() => hashTypedData(typed)).not.toThrow();
   });
 });
 

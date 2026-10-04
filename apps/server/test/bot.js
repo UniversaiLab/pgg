@@ -117,6 +117,7 @@ export class Bot {
   }
 
   #onMessage(msg) {
+    this.onMessageHook?.(msg);
     this.log.push(msg);
     if (this.validate) {
       const parsed = ServerMessage.safeParse(msg);

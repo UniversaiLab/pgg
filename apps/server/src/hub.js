@@ -10,18 +10,33 @@ import { CLIENT, CLOSE, ERR, LIMITS, PROTOCOL_VERSION, SERVER } from '@pgg/proto
 const MAX_STRIKES = 8; // malformed or rate-limited messages tolerated before disconnecting
 const MAX_BUFFERED_BYTES = 1_000_000; // a consumer further behind than this is dropped
 const LOBBY_INTERVAL_MS = 1000;
+const NOT_VAULT = Object.freeze({ ok: false, code: ERR.NOT_VAULT_TABLE }); // claim/sig at a play table
+
+// What a claim or a sig costs the sender in rate-limit tokens (a ping, act or seed costs 1). The actor has
+// to recover an ECDSA signature for each of them, about 1.2 ms of CPU, against microseconds for anything
+// else, so at 1 token apiece one socket could burn about 24 ms of CPU per second at the default 20
+// tokens/s, and many sockets would add up. At 10 the same socket gets 2 a second (burst 4 of the default 40),
+// while a real client sends one claim per connect and one sig per hand, many seconds apart. Keep this
+// well under the bucket capacity (RATE_CAPACITY, default 40): a bucket smaller than the cost could never
+// afford a claim or a sig. All of the cost is charged in #onMessage; nothing else knows about it.
+export const SIGNATURE_COST = 10;
+const COSTLY = new Set([CLIENT.CLAIM, CLIENT.SIGN]);
 
 export class Hub {
   #server = null;
   #sockets = new Map(); // playerId -> ws
   #wallet;
   #registry;
+  #schema;
   #lobbyDirty = false;
   #lobbyTimer = null;
 
-  constructor({ wallet, registry }) {
+  // `schema` is only ever swapped by tests, to reach the dispatch default with a message the real
+  // schema would stop earlier.
+  constructor({ wallet, registry, schema = ClientMessage }) {
     this.#wallet = wallet;
     this.#registry = registry;
+    this.#schema = schema;
   }
 
   setServer(server) {
@@ -120,9 +135,14 @@ export class Hub {
     }
     let message;
     try {
-      message = ClientMessage.parse(JSON.parse(raw));
+      message = this.#schema.parse(JSON.parse(raw));
     } catch {
       return this.#strike(ws, ERR.BAD_MESSAGE, 'malformed message');
+    }
+    // The type is only known after parsing, and the token above was taken before it so garbage stays
+    // cheap to refuse. A valid claim or sig pays the rest of its cost here, before it can reach the actor.
+    if (COSTLY.has(message.t) && !ws.data.bucket.take(SIGNATURE_COST - 1)) {
+      return this.#strike(ws, ERR.RATE_LIMITED, 'slow down');
     }
     this.#dispatch(ws.data.player, message);
   }
@@ -146,6 +166,19 @@ export class Hub {
       if (refuse(target.join(player, message), 'join')) balance();
       return;
     }
+    if (message.t === CLIENT.CLAIM) {
+      // Names a table, like join: the player is not seated yet when they prove which seat is theirs.
+      const target = this.#registry.get(message.tableId);
+      if (target?.isVault !== true) return refuse(NOT_VAULT, 'claim');
+      // One table at a time, as for join. Claiming the table they already sit at is how a reload gets
+      // its seat back, so that one goes through.
+      const sitting = this.#registry.tableOf(id);
+      if (sitting !== null && sitting !== target) {
+        return refuse({ ok: false, code: ERR.ALREADY_SEATED }, 'claim');
+      }
+      const { tableId, address, sig } = message;
+      return void refuse(target.claim(player, { tableId, address, sig }), 'claim');
+    }
 
     // Everything else acts on the table the player is already sitting at. The client never names
     // a table, so it cannot act on someone else's.
@@ -166,6 +199,29 @@ export class Hub {
         return void refuse(actor.back(id), 'back');
       case CLIENT.SYNC:
         return void refuse(actor.sync(id), 'sync');
+      case CLIENT.SIGN: {
+        // FOR THE ACTOR AUTHOR (CORE): the actor is found through the registry, i.e. through what the
+        // actor reported with onSeat(playerId, tableId). A player the registry does not know (never
+        // registered, or unseated) gets not-seated here, and their signature never reaches the actor.
+        // That is intended; keep the registry true instead:
+        //  - call onSeat(playerId, tableId) at claim time, not only at join (vault tables have no join),
+        //    or the first sig a claimed member sends is refused;
+        //  - keep every roster member registered through stall, exit and close, even when they are away
+        //    or at zero chips. The late signature that ends a stall or settles an epoch comes from the
+        //    very player most likely to have been parked;
+        //  - call onSeat(playerId, null) only once their chips have really left the table.
+        // A late or duplicate signature is the actor's business; it acknowledges those silently.
+        if (actor.isVault !== true) return void refuse(NOT_VAULT, 'sig');
+        const { nonce, digest, sig } = message;
+        return void refuse(actor.vaultSign(player, { nonce, digest, sig }), 'sig');
+      }
+      default:
+        // A message the schema accepts but nobody routes is a server bug; say so instead of
+        // dropping it, so the sender is not left waiting for a reply that never comes.
+        return void refuse(
+          { ok: false, code: ERR.BAD_MESSAGE, msg: 'message not handled' },
+          message.t,
+        );
     }
   }
 }

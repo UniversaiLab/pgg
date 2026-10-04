@@ -10,18 +10,22 @@ export const VAULT_VERSION = '1';
 
 export const STATE_PRIMARY_TYPE = 'State';
 
-export const STATE_TYPES = {
-  State: [
-    { name: 'tableId', type: 'bytes32' },
-    { name: 'nonce', type: 'uint64' },
-    { name: 'isFinal', type: 'bool' },
-    { name: 'players', type: 'address[]' },
-    { name: 'balances', type: 'uint256[]' },
-    { name: 'keep', type: 'bool[]' },
-    { name: 'rake', type: 'uint256' },
-    { name: 'volume', type: 'uint256' },
-  ],
-};
+// Deeply frozen: @pgg/vault builds STATE_TYPEHASH from this once at load and also reads the live object when
+// it encodes a state, so a change after load would make the two disagree and every digest wrong.
+const field = (name, type) => Object.freeze({ name, type });
+
+export const STATE_TYPES = Object.freeze({
+  State: Object.freeze([
+    field('tableId', 'bytes32'),
+    field('nonce', 'uint64'),
+    field('isFinal', 'bool'),
+    field('players', 'address[]'),
+    field('balances', 'uint256[]'),
+    field('keep', 'bool[]'),
+    field('rake', 'uint256'),
+    field('volume', 'uint256'),
+  ]),
+});
 
 /** The domain of one deployment: the chain it lives on and its address. */
 export function vaultDomain({ chainId, verifyingContract }) {
