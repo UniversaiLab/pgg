@@ -15,5 +15,6 @@
   },
   "devDependencies": {
     "viem": "^2.57.2"
-  }
+  },
+  "sideEffects": false
 }
