@@ -10,7 +10,7 @@ Plain JavaScript (ES modules) everywhere; only the contracts are Solidity.
 
 | Path | What |
 | --- | --- |
-| `packages/engine` | Hold'em table (`poker-ts`), commit-reveal dealer, rake. `@pgg/engine/fairness` is browser-safe. |
+| `packages/engine` | Hold'em table (betting via `poker-ts`), our own settlement, commit-reveal dealer, rake. Only `@pgg/engine/fairness` is browser-safe. |
 | `packages/protocol` | zod schemas for every client↔server message. |
 | `apps/server` | Hono + Bun WebSocket game server. |
 | `apps/web` | Mobile-only React client (Vite, Tailwind, motion). |

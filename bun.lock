@@ -40,8 +40,6 @@
       "dependencies": {
         "@noble/hashes": "^2.4.0",
         "poker-ts": "1.5.0",
-      },
-      "devDependencies": {
         "pokersolver": "^2.1.4",
       },
     },
