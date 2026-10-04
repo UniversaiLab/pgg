@@ -1,0 +1,13 @@
+PGG
+===
+
+PGG is derived from pok3rNetwork/pok3r (https://github.com/pok3rNetwork/pok3r),
+licensed under the MIT License, Copyright (c) 2022 pok3rNetwork.
+
+The upstream `staging` branch was imported at commit 0437e8e ("Backend Fixes (#27)")
+with its full git history preserved. The original license text is kept unchanged
+in the LICENSE file.
+
+Substantial parts of the upstream code (Hardhat contracts, Express API, Next.js
+client, Chainlink VRF integration) are being replaced; see docs/architecture.md
+for what remains and why.
