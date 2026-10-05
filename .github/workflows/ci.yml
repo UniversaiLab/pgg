@@ -46,4 +46,6 @@ jobs:
         working-directory: .
         env:
           PGG_REQUIRE_CHAIN_TESTS: '1'
-        run: bun test ./packages/vault
+        # The server's chain tests (the FakeChain-vs-anvil parity test) live with the server code; the plain
+        # vault server tests in the same folder run again here, which is cheap.
+        run: bun test ./packages/vault ./apps/server/test/vault
