@@ -49,6 +49,17 @@ describe('NullWallet', () => {
     expect(wallet.issued).toBe(0);
   });
 
+  test('it keeps no state: nothing a caller does is remembered, so a missed call site leaves no trace', () => {
+    const wallet = new NullWallet();
+    wallet.open('p1');
+    wallet.credit('p1', 500);
+    wallet.creditHouse(40);
+    wallet.debit('p1', 1);
+    wallet.balance('p1');
+    expect(Object.getOwnPropertyNames(wallet)).toEqual([]);
+    expect(Object.getOwnPropertySymbols(wallet)).toEqual([]);
+  });
+
   test('every balance is 0 and open() creates nothing', () => {
     const wallet = new NullWallet();
     expect(wallet.open('p1')).toBe(0);

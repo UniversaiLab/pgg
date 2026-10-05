@@ -18,6 +18,9 @@ import { DoubleSignError, STORE_METHODS, StoreError } from '../../src/vault/stor
 import { DOMAIN, keyFor, makeWorld, VAULT } from '../fixtures/store-world.js';
 
 const w = makeWorld();
+// Same players and keys, another generation: a different tableKey, so the same nonce is a different state
+// with a different digest.
+const w2 = makeWorld({ generation: 2 });
 const OTHER_TABLE = `0x${'22'.repeat(32)}`;
 
 const thrown = (fn) => {
@@ -151,6 +154,18 @@ export function runStoreContract(name, makeStore) {
           dust: {},
           lastAppliedEvent: null,
         });
+      });
+
+      test('a table key is a non-empty string of at most 256 characters', () => {
+        const longest = `0x${'a'.repeat(254)}`;
+        expect(store.loadTable(longest)).toBeNull();
+        for (const bad of [`${longest}a`, '', 5, null, undefined, {}]) {
+          expect(thrown(() => store.loadTable(bad))).toBeInstanceOf(TypeError);
+        }
+        expect(thrown(() => store.saveTable(w.record({ tableKey: `${longest}a` })))).toBeInstanceOf(
+          TypeError,
+        );
+        expect(store.saveTable(w.record({ tableKey: longest })).tableKey).toBe(longest);
       });
 
       test('an unknown table loads as null and keys are case-insensitive', () => {
@@ -520,6 +535,19 @@ export function runStoreContract(name, makeStore) {
         ]);
       });
 
+      test('a nonce given as a plain number must be a safe integer', () => {
+        reserve(1);
+        const sig = w.arbiterSigFor(w.stateAt(1n));
+        expect(store.getSigned(w.tableKey, 1)).not.toBeNull(); // 1 is 1n
+        for (const bad of [2 ** 53, 2 ** 60, 1.5, -1, '1', null]) {
+          expect(thrown(() => store.getSigned(w.tableKey, bad))).toBeInstanceOf(
+            typeof bad === 'number' && bad < 0 ? RangeError : TypeError,
+          );
+          expect(thrown(() => store.attachArbiterSig(w.tableKey, bad, sig))).toBeDefined();
+        }
+        expect(store.getSigned(w.tableKey, 1n).arbiterSig).toBeNull();
+      });
+
       test('attachArbiterSig needs a reserved nonce and a 65-byte signature', () => {
         const sig = w.arbiterSigFor(w.stateAt(1n));
         expectStoreError(() => store.attachArbiterSig(w.tableKey, 1n, sig), 'not-reserved');
@@ -705,6 +733,28 @@ export function runStoreContract(name, makeStore) {
         expect(save(bundle)).toEqual({ saved: true });
         expect(store.loadBundle(w.tableKey)).toEqual(bundle);
         expect(store.loadFinalBundle(w.tableKey)).toBeNull();
+      });
+
+      test('a bundle in upper-case hex is stored in canonical form, signatures under lower-case addresses', () => {
+        const upper = (hex) => `0x${hex.slice(2).toUpperCase()}`;
+        const state = w.stateAt(2n);
+        const canonical = w.bundleFor(state);
+        const shouting = {
+          domain: { ...DOMAIN, verifyingContract: upper(VAULT) },
+          state: { ...state, tableId: upper(state.tableId), players: state.players.map(upper) },
+          arbiterSig: upper(canonical.arbiterSig),
+          playerSigs: canonical.playerSigs.map(upper),
+        };
+        expect(save(shouting)).toEqual({ saved: true });
+        expect(store.loadBundle(w.tableKey)).toEqual(canonical);
+        expect(store.getSigned(w.tableKey, 2n)).toEqual({
+          state,
+          digest: w.digestOf(state),
+          arbiterSig: canonical.arbiterSig,
+        });
+        expect([...store.playerSigs(w.tableKey, 2n)]).toEqual(
+          w.players.map((address, i) => [address, w.playerSigFor(state, i)]),
+        );
       });
 
       test('a bundle with 2^256-1 amounts and a 2^64-1 nonce survives the trip', () => {
@@ -1030,12 +1080,15 @@ export function runStoreContract(name, makeStore) {
         store.saveTable(w.record({ epochBaseNonce: 2n }));
         expect(store.loadBundle(w.tableKey)).toBeNull();
         expect(store.loadFinalBundle(w.tableKey)).toEqual(final2);
-        // a newer non-final bundle does not displace it; a newer final does
+        // a newer non-final bundle does not displace it as the final one, but it is the newest bundle
         save(w.bundleFor(w.stateAt(3n)));
         expect(store.loadFinalBundle(w.tableKey)).toEqual(final2);
+        expect(store.loadBundle(w.tableKey)).toEqual(w.bundleFor(w.stateAt(3n)));
+        // a newer final does
         const final5 = w.bundleFor(w.stateAt(5n, { isFinal: true, keep }));
         save(final5);
         expect(store.loadFinalBundle(w.tableKey)).toEqual(final5);
+        expect(store.loadBundle(w.tableKey)).toEqual(final5);
         // an older final (not newer than the latest) does not come back
         expect(save(w.bundleFor(w.stateAt(4n, { isFinal: true, keep })))).toEqual({
           saved: false,
@@ -1052,6 +1105,109 @@ export function runStoreContract(name, makeStore) {
         expect(loaded.state.isFinal).toBe(true);
         expect(loaded.state.keep).toEqual(keep);
         expect(store.getSigned(w.tableKey, 2n).state.keep).toEqual(keep);
+      });
+    });
+
+    // ---- tables are isolated ------------------------------------------------------------
+
+    describe('two tables in one store', () => {
+      // Nothing of one table may ever show up in the other.
+      test('signatures, rounds, bundles and alarms stay with their own table', () => {
+        store.saveTable(w2.record());
+        expect(w2.tableKey).not.toBe(w.tableKey);
+
+        reserve(1);
+        reserve(2);
+        const own = w.stateAt(2n);
+        store.attachArbiterSig(w.tableKey, 2n, w.arbiterSigFor(own));
+        store.addPlayerSig(w.tableKey, 2n, w.players[0], w.playerSigFor(own, 0));
+        store.saveBundle(w.tableKey, w.bundleFor(w.stateAt(1n)), w.verifyCtx());
+        store.saveBundle(
+          w.tableKey,
+          w.bundleFor(w.stateAt(3n, { isFinal: true, keep: [true, true, true] })),
+          w.verifyCtx(),
+        );
+        store.saveBundle(w.tableKey, w.bundleFor(w.stateAt(3n, { variant: 1n })), w.verifyCtx());
+
+        // table 2 has seen none of it
+        expect(store.getSigned(w2.tableKey, 1n)).toBeNull();
+        expect(store.getSigned(w2.tableKey, 2n)).toBeNull();
+        expect(store.playerSigs(w2.tableKey, 2n).size).toBe(0);
+        expect(store.openRound(w2.tableKey)).toBeNull();
+        expect(store.latestSigned(w2.tableKey)).toBeNull();
+        expect(store.loadBundle(w2.tableKey)).toBeNull();
+        expect(store.loadFinalBundle(w2.tableKey)).toBeNull();
+        expect(store.alarms(w2.tableKey)).toEqual([]);
+        expect(store.loadTable(w2.tableKey)).toMatchObject({
+          nonceHw: 0n,
+          rakeCum: 0n,
+          volumeCum: 0n,
+        });
+
+        // and the same nonces in table 2 are its own, whatever table 1 holds at them
+        const second = w2.stateAt(2n);
+        expect(store.reserve(w2.tableKey, second, w2.digestOf(second))).toBe(true);
+        expect(store.playerSigs(w2.tableKey, 2n).size).toBe(0);
+        expect(store.getSigned(w2.tableKey, 2n)).toEqual({
+          state: second,
+          digest: w2.digestOf(second),
+          arbiterSig: null,
+        });
+        expect(store.openRound(w2.tableKey).nonce).toBe(2n);
+        // the same player at the same nonce signs in each table separately: stored, not "already there"
+        expect(
+          store.addPlayerSig(w2.tableKey, 2n, w.players[0], w2.playerSigFor(second, 0)),
+        ).toEqual({
+          stored: true,
+          conflict: false,
+        });
+        expect(store.attachArbiterSig(w2.tableKey, 2n, w2.arbiterSigFor(second))).toEqual({
+          stored: true,
+          conflict: false,
+        });
+        expect(store.playerSigs(w2.tableKey, 2n).get(w.players[0])).toBe(
+          w2.playerSigFor(second, 0),
+        );
+        expect(store.getSigned(w.tableKey, 2n).digest).toBe(w.digestOf(own));
+        expect(store.getSigned(w.tableKey, 2n).arbiterSig).toBe(w.arbiterSigFor(own));
+        expect(store.playerSigs(w.tableKey, 2n).get(w.players[0])).toBe(w.playerSigFor(own, 0));
+        expect(store.playerSigs(w.tableKey, 2n).size).toBe(1);
+        expect(store.alarms(w.tableKey)).toHaveLength(1);
+        expect(store.alarms()).toHaveLength(1);
+
+        // a bundle of table 2 is saved, and only table 2 sees it
+        expect(store.saveBundle(w2.tableKey, w2.bundleFor(second), w2.verifyCtx())).toEqual({
+          saved: true,
+        });
+        expect(store.loadBundle(w2.tableKey)).toEqual(w2.bundleFor(second));
+        expect(store.loadBundle(w.tableKey).state.nonce).toBe(3n);
+        expect(store.loadFinalBundle(w2.tableKey)).toBeNull();
+        expect(store.loadFinalBundle(w.tableKey).state.nonce).toBe(3n);
+      });
+
+      test('an epoch change in one table does not move the other', () => {
+        store.saveTable(w2.record());
+        reserve(1);
+        const mine = w2.stateAt(1n);
+        store.reserve(w2.tableKey, mine, w2.digestOf(mine));
+        store.saveTable(w.record({ epochBaseNonce: 1n }));
+        expect(store.openRound(w.tableKey)).toBeNull();
+        expect(store.latestSigned(w.tableKey)).toBeNull();
+        expect(store.openRound(w2.tableKey).nonce).toBe(1n);
+        expect(store.latestSigned(w2.tableKey).state.nonce).toBe(1n);
+        expect(store.loadTable(w2.tableKey).epochBaseNonce).toBe(0n);
+      });
+
+      test('jobs carry their table and the cursor is one for the whole store', () => {
+        store.saveTable(w2.record());
+        store.enqueueJob({ key: 'a', kind: 'settle', tableKey: w.tableKey, priority: 1 });
+        store.enqueueJob({ key: 'b', kind: 'settle', tableKey: w2.tableKey, priority: 1 });
+        expect(store.pendingJobs().map((j) => [j.key, j.tableKey])).toEqual([
+          ['a', w.tableKey],
+          ['b', w2.tableKey],
+        ]);
+        store.setCursor(10);
+        expect(store.getCursor()).toBe(10);
       });
     });
 
@@ -1216,6 +1372,23 @@ export function runStoreContract(name, makeStore) {
         });
       });
 
+      test('a second signature, and a bundle that completes a half-signed round', () => {
+        // the first signature is already stored: a rollback must take out only what the failed call added
+        const setup = (s) => {
+          reserveUpTo(s, 1);
+          s.addPlayerSig(w.tableKey, 1n, w.players[0], w.playerSigFor(state1, 0));
+        };
+        crashPoints({
+          setup,
+          run: (s) => s.addPlayerSig(w.tableKey, 1n, w.players[1], w.playerSigFor(state1, 1)),
+        });
+        crashPoints({
+          setup,
+          run: (s) => expect(s.saveBundle(w.tableKey, w.bundleFor(state1), ctx).saved).toBe(true),
+          minWrites: 4,
+        });
+      });
+
       test('a conflicting signature records its alarm or nothing', () => {
         crashPoints({
           setup: (s) => {
@@ -1367,6 +1540,12 @@ export function runStoreContract(name, makeStore) {
         expect(store.pendingJobs().map((j) => j.key)).toEqual(['b', 'c']);
         store.enqueueJob(job('a', 1));
         expect(store.pendingJobs().map((j) => j.key)).toEqual(['b', 'c', 'a']);
+        // and again, in the other order than they were first queued: each goes behind everything before it
+        store.markJob('b', 'failed');
+        store.markJob('a', 'done');
+        store.enqueueJob(job('b', 1));
+        store.enqueueJob(job('a', 1));
+        expect(store.pendingJobs().map((j) => j.key)).toEqual(['c', 'b', 'a']);
       });
 
       test('pendingJobs is priority first (high to low), then insertion order', () => {
@@ -1532,7 +1711,17 @@ export function runStoreContract(name, makeStore) {
 
       test('refuses things that are not block numbers', () => {
         store.setCursor(5);
-        for (const bad of [-1, 1.5, '7', null, undefined, Number.NaN, 2n ** 64n]) {
+        for (const bad of [
+          -1,
+          1.5,
+          '7',
+          null,
+          undefined,
+          Number.NaN,
+          2n ** 64n,
+          2 ** 53,
+          2 ** 60,
+        ]) {
           expect(thrown(() => store.setCursor(bad))).toBeDefined();
         }
         expect(store.getCursor()).toBe(5);
@@ -1557,6 +1746,46 @@ export function runStoreContract(name, makeStore) {
           }),
         );
         expect(store.alarms()).toEqual([]);
+      });
+
+      test('one alarm per table, nonce, kind and signer; anything else is another alarm', () => {
+        const bad = (n) =>
+          signDigest(keyFor('other-signer'), w.digestOf(w.stateAt(n, { variant: 9n })));
+        store.saveTable(w2.record());
+        reserveUpTo(store, 2);
+        for (const n of [1n, 2n]) {
+          const state = w.stateAt(n);
+          store.attachArbiterSig(w.tableKey, n, w.arbiterSigFor(state));
+          store.addPlayerSig(w.tableKey, n, w.players[0], w.playerSigFor(state, 0));
+          store.addPlayerSig(w.tableKey, n, w.players[1], w.playerSigFor(state, 1));
+        }
+        const theirs = w2.stateAt(1n);
+        store.reserve(w2.tableKey, theirs, w2.digestOf(theirs));
+        store.addPlayerSig(w2.tableKey, 1n, w.players[0], w2.playerSigFor(theirs, 0));
+
+        store.addPlayerSig(w.tableKey, 1n, w.players[0], bad(1n)); // player 0, nonce 1
+        store.addPlayerSig(w.tableKey, 1n, w.players[1], bad(1n)); // player 1, nonce 1
+        store.addPlayerSig(w.tableKey, 2n, w.players[0], bad(2n)); // player 0, nonce 2
+        store.attachArbiterSig(w.tableKey, 1n, bad(1n)); //            the arbiter, nonce 1
+        store.attachArbiterSig(w.tableKey, 2n, bad(2n)); //            the arbiter, nonce 2
+        store.addPlayerSig(w2.tableKey, 1n, w.players[0], bad(1n)); // player 0, nonce 1, other table
+        store.addPlayerSig(w.tableKey, 1n, w.players[0], bad(1n)); //  the first one again
+        store.attachArbiterSig(w2.tableKey, 1n, w2.arbiterSigFor(theirs));
+        store.attachArbiterSig(w2.tableKey, 1n, bad(1n)); //           the arbiter, nonce 1, other table
+
+        expect(
+          store.alarms().map((a) => [a.kind, a.tableKey, a.nonce, a.detail.subject, a.count]),
+        ).toEqual([
+          ['player-sig-conflict', w.tableKey, 1n, w.players[0], 2],
+          ['player-sig-conflict', w.tableKey, 1n, w.players[1], 1],
+          ['player-sig-conflict', w.tableKey, 2n, w.players[0], 1],
+          ['arbiter-sig-conflict', w.tableKey, 1n, 'arbiter', 1],
+          ['arbiter-sig-conflict', w.tableKey, 2n, 'arbiter', 1],
+          ['player-sig-conflict', w2.tableKey, 1n, w.players[0], 1],
+          ['arbiter-sig-conflict', w2.tableKey, 1n, 'arbiter', 1],
+        ]);
+        expect(store.alarms(w2.tableKey).map((a) => a.id)).toEqual([6, 7]);
+        expect(store.alarms(w.tableKey)).toHaveLength(5);
       });
 
       test('are listed in the order they were raised, each with its own id', () => {

@@ -15,6 +15,18 @@ export {
 } from './bundle.js';
 export { UINT64_MAX, UINT256_MAX } from './bytes.js';
 export {
+  chainShowsSettled,
+  createRpcChainView,
+  decodeSeat,
+  decodeTableRow,
+  EPOCH_RULES,
+  encodeSeatsCall,
+  encodeTablesCall,
+  SEATS_SELECTOR,
+  TABLES_SELECTOR,
+  verifyEpochAgainstChain,
+} from './chainview.js';
+export {
   checkSettle,
   checkState,
   ERRORS,

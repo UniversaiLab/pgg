@@ -898,6 +898,21 @@ describe('startExit', () => {
     chain.pause(true);
     expect(exitAs(w, w.bundle(w.hand(g)), w.players[0])).toEqual(ok);
   });
+
+  // The premise of stallAction and of the reconciler's rollover rows: in the first round of epoch 2 the
+  // chain's nonce IS the previous final's nonce, so that final can neither start an exit nor be settled again.
+  test('after a rollover the previous final is not newer than the table: StaleNonce for startExit and for settle', () => {
+    const w = makeWorld();
+    const fin = w.final(w.hand(w.activate()), [true, true, true]);
+    expectOk(w.chain.send(relayerOf(w), 'settle', { bundle: w.bundle(fin) }));
+    expectOk(w.chain.send(arbiterOf(w), 'start', { tableKey: w.tableKey, players: w.players }));
+    expect(w.chain.live(w.tableKey)).toMatchObject({ status: 'Active', nonce: fin.nonce });
+    const stale = revert('StaleNonce', fin.nonce, fin.nonce);
+    expect(exitAs(w, w.bundle(fin), arbiterOf(w))).toEqual(stale);
+    expect(exitAs(w, w.bundle(fin), w.players[0])).toEqual(stale);
+    expect(w.chain.send(relayerOf(w), 'settle', { bundle: w.bundle(fin) })).toEqual(stale);
+    expect(w.chain.live(w.tableKey)).toMatchObject({ status: 'Active', nonce: fin.nonce });
+  });
 });
 
 describe('startExitFromDeposits', () => {
@@ -1198,6 +1213,21 @@ describe('finalizeExit', () => {
         maxDeposit: 10n,
       }),
     ).toEqual(revert('TableExists'));
+  });
+
+  test('a state whose arrays are the wrong length just hashes to something else: DigestMismatch, never a crash', () => {
+    const { w, chain, s2 } = exiting();
+    chain.advanceTime(3601);
+    for (const broken of [
+      { ...s2, balances: s2.balances.slice(1) },
+      { ...s2, keep: s2.keep.slice(1) },
+      { ...s2, players: s2.players.slice(1) },
+      { ...s2, balances: [...s2.balances, 0n] },
+    ]) {
+      expect(finalizeAs(w, broken)).toEqual(revert('DigestMismatch'));
+    }
+    expect(chain.live(w.tableKey).status).toBe('Exiting');
+    expect(finalizeAs(w, s2)).toEqual(ok);
   });
 
   test('a state that cannot be decoded is Malformed', () => {
@@ -1528,6 +1558,83 @@ describe('jobs: the queue', () => {
     expect(chain.live(w.tableKey).status).toBe('Active');
   });
 
+  // The other table is real and in the state where the contract WOULD accept the foreign state, so the only
+  // thing standing between the job and a transaction on the wrong table is the executor's own check.
+  test('every kind that carries a state or bundle is refused when it is for another table, and that table is untouched', () => {
+    const cases = [
+      ['settle', (w, fin) => ({ bundle: w.bundle(fin) }), 'Active'],
+      ['startExit', (w, _fin, s1) => ({ bundle: w.bundle(s1) }), 'Active'],
+      ['challenge', (w, _fin, _s1, s2) => ({ bundle: w.bundle(s2) }), 'Exiting'],
+      ['finalizeExit', (_w, _fin, s1) => ({ state: s1 }), 'Exiting'],
+    ];
+    for (const [kind, argsFor, otherStatus] of cases) {
+      const { w, g, chain } = active();
+      const other = `0x${'12'.repeat(32)}`;
+      expectOk(
+        chain.send(arbiterOf(w), 'createTable', {
+          tableKey: other,
+          maxPlayers: 6,
+          minDeposit: UNIT,
+          maxDeposit: 10_000_000n * UNIT,
+        }),
+      );
+      w.seats.forEach((seat, i) => {
+        chain.mint(seat.wallet, w.amounts[i]);
+        expectOk(chain.deposit(other, seat.wallet, w.amounts[i], seat.session));
+      });
+      expectOk(chain.send(arbiterOf(w), 'start', { tableKey: other, players: w.players }));
+
+      const foreign = (s) => ({ ...s, tableId: other });
+      const s1 = foreign(w.hand(g));
+      const s2 = foreign(w.hand(s1));
+      const fin = foreign(w.final(s1));
+      if (otherStatus === 'Exiting') {
+        expectOk(chain.send(w.players[0], 'startExit', { bundle: w.bundle(s1) }));
+        // challenge needs the window open on `other`, finalizeExit needs it closed
+        if (kind === 'finalizeExit') chain.advanceTime(3601);
+      }
+      const before = {
+        other: chain.live(other),
+        table: chain.live(w.tableKey),
+        block: chain.block,
+      };
+
+      w.resolver.set(kind, argsFor(w, fin, s1, s2));
+      chain.submit(makeJob(kind, w.tableKey));
+      expect(chain.tick().jobs[0]).toMatchObject({
+        kind,
+        outcome: 'failed',
+        error: 'JobTableMismatch',
+      });
+      expect(failures(chain).at(-1)).toMatchObject({
+        kind,
+        tableKey: w.tableKey,
+        error: 'JobTableMismatch',
+        retryable: false,
+        args: [other],
+      });
+      expect(chain.block).toBe(before.block);
+      expect(chain.live(other)).toEqual(before.other);
+      expect(chain.live(w.tableKey)).toEqual(before.table);
+      expect(chain.sent.filter((s) => s.kind === kind)).toEqual([]);
+    }
+  });
+
+  test('the job decides which table it acts on: a tableKey inside the resolver args is ignored', () => {
+    const w = makeWorld();
+    const other = `0x${'12'.repeat(32)}`;
+    w.resolver.set('createTable', {
+      tableKey: other,
+      maxPlayers: 6,
+      minDeposit: UNIT,
+      maxDeposit: 100n * UNIT,
+    });
+    w.chain.submit(makeJob('createTable', w.tableKey));
+    expect(w.chain.tick().jobs[0].outcome).toBe('sent');
+    expect(w.chain.live(w.tableKey)).toMatchObject({ status: 'Filling' });
+    expect(w.chain.live(other)).toBeNull();
+  });
+
   test('a job submitted while a poll runs waits for the next poll; the running key cannot be submitted twice', () => {
     const w = makeWorld();
     const first = makeJob('start', w.tableKey);
@@ -1635,6 +1742,12 @@ describe('jobs: failures', () => {
     });
     // a start on an Active table: WrongStatus(Exiting = 3)
     w.run('start', { players: w.players });
+    expect(chain.sent.at(-1)).toMatchObject({
+      kind: 'start',
+      sender: arbiterOf(w),
+      ok: false,
+      error: 'WrongStatus',
+    });
     expect(failures(chain).at(-1)).toMatchObject({
       kind: 'start',
       error: 'WrongStatus',

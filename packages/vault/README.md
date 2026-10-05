@@ -165,11 +165,12 @@ the contract accepts, so servers and clients keep the newest one durably.
 | Id | Rule | Where |
 | --- | --- | --- |
 | **C1a** | Sign only the very next nonce after the newest state you hold (default step 1, `maxNonceGap`), or the identical digest again; never two digests at one nonce. | `clientShouldSign`, `decideSign` |
-| **C1b** | Every balance, the rake and the volume move by exactly what the client saw at the table since the base state. | `clientShouldSign` |
+| **C1b** | Every balance and the rake move by exactly what the client saw at the table since the base state, and so does the volume, unless the pot is unknown (`observed.pot` null): then it only may not go down. | `clientShouldSign` |
 | **C1c** | Balances plus rake equal the base state's balances plus rake. | `clientShouldSign` |
 | **C1d** | Same table, roster and domain as pinned; the client computes the digest itself and signs that one. | `clientShouldSign` |
-| **C1e** | Rake never decreases and stays within `maxRakeBps` of cumulative volume. | `clientShouldSign` |
-| **C2** | A final state only when leaving or rotating, nothing at all after one in the epoch (signed by me or all-signed as the baseline), and no keep flag in a state that is not final. | `clientShouldSign`, `decideSign` |
+| **C1e** | Rake never decreases and stays within `maxRakeBps` of cumulative volume, and neither is so large that the contract's cap check would panic. | `clientShouldSign` |
+| **C2** (F13) | Nothing at all after a final in the epoch (signed by me or all-signed as the baseline). A final state is otherwise signed, whatever the intent, unless I asked to leave and it keeps me (states at or below `leaveAckNonce` are excused), or it keeps a seat with less than one chip. A cash-out I did not ask for is accepted. No keep flag in a state that is not final. | `clientShouldSign`, `decideSign` |
+| **F1** | The chain, not the server, is the witness of an epoch: before signing the first state of an epoch the client checks the table and the seats against the `epoch` message. | `verifyEpochAgainstChain`, `chainShowsSettled` (`chainview.js`) |
 | **S1** | No next hand before the last state has every signature, verified for this table and domain. | `canDeal`, `dealBlocker` |
 | **S3** | No co-signing with a session key past its policy expiry. | `serverMayCoSign` |
 | **S4** | Never two states at one nonce (the arbiter uses `decideSign` too). | `decideSign` |
@@ -212,10 +213,14 @@ view = {          // what THIS client knows, none of it taken from the request
   last,           // null | { nonce, digest, isFinal, state? }: the durable record read by decideSign.
                   //   `state` is the full State I signed. REQUIRED when `last.nonce` is above the baseline's
                   //   nonce (I signed a hand whose round is still open): the money is then judged against it.
-  intent,         // 'play' | 'leave' | 'rotate': leave = I asked to leave; rotate = a rotation is due
+  intent,         // 'play' | 'leave' ('rotate' is an alias of 'play'): leave = I asked to leave
+  leaveAckNonce,  // optional (bigint | number | null): the head nonce the server had acknowledged when I
+                  //   pressed Leave. Only read when intent is 'leave': a final state at or below it may keep me
   observed,       // null | { deltas, rake, pot }: what happened at the table SINCE THE BASE STATE, in CHIPS
                   //   (number or bigint); deltas[i] is the chips player i (state order) won or lost, rake and
-                  //   pot are chips and not negative. null means no hand was seen: all of them are 0.
+                  //   pot are chips and not negative. pot may be null (explicitly): the hand was not watched
+                  //   live and only the current public stacks are known (see C1b below). A missing pot is a
+                  //   VIEW error. observed = null means no hand was seen: all of them are 0, pot included.
   myBalance,      // optional bigint: my balance at the baseline in token units, from MY OWN records
   maxNonceGap,    // optional integer >= 1, default 1: how far above the newest state held a nonce may be
 }
@@ -252,14 +257,28 @@ exception: it fails closed).
    one; a bigger jump is refused because at the extreme one signature would burn the whole uint64 space, and no
    later state could follow it or challenge an exit from it. Raise `maxNonceGap` only if a server is known to
    skip nonces. A higher nonce after a signed final is `C2`.
-4. `C2`: nothing may follow a final baseline; a final state needs `intent` `leave` or `rotate`; when leaving,
-   `keep[me]` must be false; no kept seat may have a zero balance (`settle` would revert with `BadKeep`); a state
-   that is not final must have every `keep` false (the contract reads `keep` only in `settle`, but the digest
-   covers it, so a server could mint many digests for one economic state).
-5. `C1e`: `rake >= base.rake` and `rake * 10000 <= maxRakeBps * volume`.
+4. `C2` (F13): nothing may follow a final baseline. A final state needs **no** intent of its own: a due rotation
+   rides in a hand-end state the client could not have predicted, so it is signed while playing. What is refused
+   in a final state: **(a)** `keep[me]` when `intent` is `'leave'`, except for a state whose nonce is at or below
+   `leaveAckNonce` (that state was already in flight when I pressed Leave: I sign it and `leave()` in Filling);
+   **(b)** a kept seat, mine or anyone's, whose balance is below one chip unit (`balance < unit`): the contract
+   only reverts with `BadKeep` for zero, but dust alone never keeps a seat; **(c)** nothing else: a
+   `keep[me] = false` I did not ask for is a cash-out, never a loss, and is accepted. A state that is not final
+   must have every `keep` false (the contract reads `keep` only in `settle`, but the digest covers it, so a
+   server could mint many digests for one economic state). `leaveAckNonce` only widens the set of states that
+   cost the leaver a `leave()` call in Filling, never money, but take it from your own records where you can (the
+   newest nonce you held or were asked to sign when you pressed Leave).
+5. `C1e`: `rake >= base.rake` and `rake * 10000 <= maxRakeBps * volume`; and neither product may exceed
+   `2^256 - 1`, because the contract would revert with `Panic(0x11)` and the state could never be used for an
+   exit, a challenge or a settle (with an unknown pot nothing else bounds the volume).
 6. `C1c`: `sum(balances) + rake == sum(base.balances) + base.rake`.
 7. `C1b`: `balances[i] - base.balances[i] == deltas[i] * unit` for every seat, `rake - base.rake == observed.rake * unit`,
-   `volume - base.volume == observed.pot * unit`.
+   and `volume - base.volume == observed.pot * unit` when the pot is a number. **`observed.pot = null`**: the
+   client did not watch the hand live (it knows only the current public stacks), so `deltas` come from the
+   stacks and `rake = -sum(deltas)`; the balances and the rake are still compared exactly, conservation (C1c)
+   and the cumulative cap (C1e) still hold, and the volume need only not go **down**. Volume is self-attested
+   in the contract anyway (it only feeds the rake cap), and extra volume buys headroom, never money, because
+   every hand's rake is compared exactly.
 
 **`serverMayCoSign({ sessionKeyAgeMs, policyMaxMs }) -> boolean`** (S3). True while the age is within the maximum
 (equal is allowed). Anything that is not a finite non-negative number, including no argument or `null`, is `false`.
@@ -291,6 +310,80 @@ table. Reasons, in the order they are checked: `bad-view` (including a missing `
 `no-verifier`, `not-active`, `round-open`, `member-not-claimed`, `member-offline`, `no-bundle`, `bundle-not-head`,
 `bundle-final`, `bundle-incomplete`, `bundle-wrong-table` (the bundle is valid but for another domain, table or
 roster), `bundle-invalid` (a signature fails). Anything unexpected is a "no".
+
+### `chainview.js`: the chain as the witness of an epoch (F1)
+
+Browser-safe and viem-free. The server's `epoch` message is the baseline of every money check a client makes, so
+a lying server could announce a fake one. The chain is the one witness it cannot forge. **The web step passes an
+RPC-backed chain view whose `rpcUrl` and `vault` address are PINNED IN THE APP BUILD, never taken from a server
+message**; without one a client is unprotected against a lying server, which is a gate before real money, not a
+silent default.
+
+- **Calldata and decoding**, hand-written for exactly two views of `PokerVault`: `tables(bytes32)` (12 static
+  words) and `seats(bytes32,address)` (2 words). `TABLES_SELECTOR` and `SEATS_SELECTOR` are
+  `keccak256(signature)[0..4]`. `encodeTablesCall(tableKey)`, `encodeSeatsCall(tableKey, address)` (throw
+  `RangeError` on a bad key or address), `decodeTableRow(hex) -> row` (the contract's field names, the shape
+  `tableFromChain` accepts: `status`, `maxPlayers`, `seated` numbers; `nonce`, `exitDeadline` and the amounts
+  bigint; `arbiter` lowercase; `rosterHash`, `exitDigest` hex) and `decodeSeat(hex) -> { deposit, sessionKey } | null`
+  (null for an empty seat). The decoders are strict, because the node may be hostile: exact length, a status
+  above Closed, dirty bits in a uint8, uint64 or address word, a table with no status but with data in it, and a
+  seat with a deposit and no key (or the reverse) all throw `RangeError`. Tested against viem on random inputs
+  and against a real anvil.
+- **`createRpcChainView({ rpcUrl, vault, fetch = globalThis.fetch, timeoutMs = 10000 })`** ->
+  `{ async table(tableKey), async seat(tableKey, address), async blockTimestamp() }`, plain JSON-RPC over `fetch`
+  (`eth_call` at `latest`, `eth_getBlockByNumber('latest', false)`). A bad constructor argument throws; after
+  that **nothing ever throws or rejects**: every method resolves one of
+  - `table`: `{ ok: true, table: row | null }` (null: no such table) or `{ ok: false, error }`
+  - `seat`: `{ ok: true, seat: { deposit, sessionKey } | null }` or `{ ok: false, error }`
+  - `blockTimestamp`: `{ ok: true, timestamp: bigint }` (seconds) or `{ ok: false, error }`
+
+  It is strict about the response: HTTP 2xx, a body of at most 64 K characters that is JSON, exactly one JSON-RPC
+  2.0 reply object (not a batch) carrying this request's `id` and exactly one of `result` and `error`, a hex
+  string result of exactly the expected length, a minimal hex quantity for the timestamp. A network failure, a
+  timeout (the request is aborted), a revert and an address with no code (answers `0x`) are all `{ ok: false }`.
+  `timeoutMs` is enforced with `AbortSignal.timeout`, so the module reads no clock and arms no timer; on a
+  platform without it (Safari before 16) the injected `fetch` must bound the request itself, or the caller
+  must race it.
+  Bad method arguments are an `{ ok: false }` result too, with no request sent.
+- **`verifyEpochAgainstChain({ epoch, tableKey, chainTable, chainSeats, myAddress, myExpectedBalance, allowFilling })`**
+  -> `{ ok: true }` | `{ ok: true, filling: true }` | `{ ok: false, rule, detail }`. Pure; it never throws (an
+  unusable argument is `rule: 'MALFORMED'`, an unexpected exception `'INTERNAL'`, both closed).
+  `epoch` is `{ domain, state, sessionKeys, arbiter }` in internal form (`state` is the genesis, `epochBaseline`;
+  `sessionKeys[i]` is `state.players[i]`'s), `chainTable` the `tables(tableKey)` row (`decodeTableRow`,
+  `tableFromChain` or a ChainPort row; a status number or its name; `null` for no table), `chainSeats` one
+  `{ deposit, sessionKey }` or `null` per roster seat in state order, `myExpectedBalance` a bigint from the
+  client's **own** records (its deposit, or the balance of the final it signed if it stayed). Rules, in the order
+  checked (`EPOCH_RULES` documents each):
+
+  | `rule` | The chain must show |
+  | --- | --- |
+  | `table-id` | the epoch's `state.tableId` is the `tableKey` pinned |
+  | `status` | the table exists and is Active (Filling too when `allowFilling` is true) |
+  | `nonce` | `nonce` equal to the genesis nonce |
+  | `roster` | `rosterHash` equal to `rosterHash(players)` (in Filling, where it is still zero: `seated` equals the roster size) |
+  | `escrow` | `escrow == sum(balances) + rake - rakePaid` |
+  | `rake` | the genesis `rake` equals `rakePaid` |
+  | `arbiter` | the table's arbiter is the epoch's |
+  | `session-key` | every seat exists (and is not marked unconfirmed) with `sessionKey == sessionKeys[i]` |
+  | `my-balance` | my balance in the epoch equals `myExpectedBalance` |
+  | `deposit` | every seat's deposit equals its balance in the epoch |
+
+  `table-id`, `rake` and `deposit` go beyond the contract's own list; they only refuse epochs no honest server
+  builds. A pass for a Filling table (`{ ok: true, filling: true }`) does not pin the roster (the hash is set by
+  `start`): check again when it is Active, and sign nothing before.
+- **`chainShowsSettled({ chainTable, final })`** -> boolean (never throws). True when the table is Filling at a
+  nonce at or above the final's, or Active at a nonce at or above it (the next epoch's genesis nonce IS the
+  final's). Exiting, Closed, a missing table, an unreadable row and a state that is not final are false. `final`
+  is the final State I signed (or a bundle carrying it).
+- **How the web controller composes them.** Before signing the first state of any epoch, and after every `epoch`
+  message: read the table and every roster seat through the view and run `verifyEpochAgainstChain`. The record
+  of the highest nonce signed per table is a monotone high-water mark: a genesis nonce below it is refused, and
+  **a client that signed a final clears its "final" latch only when `chainShowsSettled` is true on a fresh
+  chain read**, never on the server's word. The pure check alone does not stop a server that replays the
+  CURRENT epoch's genesis after I signed a final (it matches the chain); the latch and the nonce high-water mark
+  do. The lying-server scenario (a fake epoch with the same roster at the final's nonce) is refused on `nonce`
+  until the chain really settles, and accepted after (`test/chain/chainview.test.js` runs it across a real
+  settle and start).
 
 ### `ids.js`
 
@@ -495,6 +588,9 @@ PATH=/opt/foundry:$PATH PGG_REQUIRE_CHAIN_TESTS=1 bun test packages/vault
   rolled-over epoch with rake already paid) must give the contract's first error with the same arguments, and
   the test fails if any ECDSA error or any `_verify` error is never reached. `chain/setup.js` is the shared
   set-up (one Active table of three players on anvil).
+- `chainview.test.js` and `chain/chainview.test.js`: the hand-written ABI codec against viem on random inputs, the
+  JSON-RPC view against every kind of hostile or broken node (a fake `fetch` and a real HTTP server), every refusal
+  rule of `verifyEpochAgainstChain`, the lying-server scenario, and the whole thing against a real anvil.
 - `rules.test.js`, `bundle.test.js`, `state.test.js`, `units.test.js`, `ids.test.js`, `build.test.js`, `abi.test.js`,
   `rake-ceiling.test.js`.
 - `review-*.test.js`: the adversarial review of every module. A title starting with `REVIEW BUG` or `REVIEW GAP`

@@ -99,8 +99,10 @@ const SCHEMA = [
      error TEXT,
      data TEXT
    )`,
+  // No AUTOINCREMENT here: an upsert that only bumps a count would still use up an id, and alarms are never
+  // deleted, so the plain rowid is already dense and increasing (the same ids MemoryStore hands out).
   `CREATE TABLE IF NOT EXISTS alarms (
-     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     id INTEGER PRIMARY KEY,
      key TEXT NOT NULL UNIQUE,
      kind TEXT NOT NULL,
      table_key TEXT NOT NULL,

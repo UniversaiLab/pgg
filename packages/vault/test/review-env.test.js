@@ -98,7 +98,7 @@ describe('the source text', () => {
 describe('a child process where the clock, Math.random, Buffer and the locale are booby-trapped', () => {
   // Runs the worked example (every public function on a three-player table) plus a few more calls. Any
   // read of Date.now / new Date / Math.random / Buffer, or any use of toLocale*, throws.
-  const script = `
+  const prelude = `
     const trap = (name) => () => { throw new Error('forbidden: ' + name); };
     Math.random = trap('Math.random');
     const RealDate = Date;
@@ -112,6 +112,9 @@ describe('a child process where the clock, Math.random, Buffer and the locale ar
     Array.prototype.toLocaleString = trap('Array.toLocaleString');
     const RealBuffer = globalThis.Buffer;
     Object.defineProperty(globalThis, 'Buffer', { get: trap('Buffer'), configurable: true });
+  `;
+  const script = `
+    ${prelude}
     const { main } = await import(${JSON.stringify(join(SRC, '..', 'scripts', 'example.js'))});
     const out = main();
     const V = await import(${JSON.stringify(join(SRC, 'index.js'))});
@@ -122,6 +125,44 @@ describe('a child process where the clock, Math.random, Buffer and the locale ar
 
   test('the worked example and newPrivateKey run without touching any of them', () => {
     const run = Bun.spawnSync([process.execPath, '-e', script], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, LANG: 'tr_TR.UTF-8', LC_ALL: 'tr_TR.UTF-8', TZ: 'Pacific/Kiritimati' },
+    });
+    const stderr = new TextDecoder().decode(run.stderr);
+    expect(stderr).not.toMatch(/forbidden/);
+    expect(new TextDecoder().decode(run.stdout)).toBe('{"ok":true}');
+    expect(run.exitCode).toBe(0);
+  });
+
+  test('the chain view (calldata, decoders, the RPC client with a fake fetch, the epoch checks) touches none of them either', () => {
+    const chainviewScript = `
+      ${prelude}
+      const V = await import(${JSON.stringify(join(SRC, 'index.js'))});
+      const key = '0x' + 'ab'.repeat(32);
+      const empty = '0x' + '00'.repeat(384);
+      const calls = [V.encodeTablesCall(key), V.encodeSeatsCall(key, '0x' + 'cd'.repeat(20))];
+      const row = V.decodeTableRow(empty);
+      const seat = V.decodeSeat('0x' + '00'.repeat(64));
+      const view = V.createRpcChainView({
+        rpcUrl: 'http://rpc.invalid',
+        vault: '0x' + '11'.repeat(20),
+        fetch: async (url, init) => {
+          const { id } = JSON.parse(init.body);
+          return { ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: '2.0', id, result: empty }) };
+        },
+      });
+      const table = await view.table(key);
+      const block = await view.blockTimestamp();
+      const refused = V.verifyEpochAgainstChain({});
+      const settled = V.chainShowsSettled({ chainTable: null, final: null });
+      const ok =
+        calls.every((c) => /^0x[0-9a-f]+$/.test(c)) && row.status === 0 && seat === null &&
+        table.ok === true && table.table === null && block.ok === false &&
+        refused.ok === false && refused.rule === 'MALFORMED' && settled === false;
+      process.stdout.write(JSON.stringify({ ok }));
+    `;
+    const run = Bun.spawnSync([process.execPath, '-e', chainviewScript], {
       stdout: 'pipe',
       stderr: 'pipe',
       env: { ...process.env, LANG: 'tr_TR.UTF-8', LC_ALL: 'tr_TR.UTF-8', TZ: 'Pacific/Kiritimati' },

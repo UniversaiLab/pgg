@@ -57,6 +57,17 @@ describe('SqliteStore: durability settings and the lease', () => {
     store.close();
   });
 
+  test('the exclusive lock is taken before WAL, so the wal-index lives in memory and no -shm file exists', () => {
+    const path = freshPath();
+    new SqliteStore(path).close(); // leaves a database that is already in WAL mode
+    // reopening such a file is where the order of the two pragmas shows: WAL first would map a -shm file
+    const store = new SqliteStore(path);
+    store.saveTable(w.record());
+    expect(existsSync(`${path}-shm`)).toBe(false);
+    expect(store.settings().lockingMode).toBe('exclusive');
+    store.close();
+  });
+
   test('synchronous=FULL and the exclusive lock also hold for :memory:', () => {
     const store = new SqliteStore({ path: ':memory:' });
     expect(store.settings().synchronous).toBe(2);

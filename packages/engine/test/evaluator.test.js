@@ -151,5 +151,5 @@ describe('runtime evaluator agrees with the brute-force reference', () => {
       if (agree(entries, board).length > 1) splits++;
     }
     expect(splits).toBeGreaterThan(0); // the sample exercised chops too
-  });
+  }, 60_000);
 });

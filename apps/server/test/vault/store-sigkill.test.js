@@ -41,13 +41,15 @@ const thrown = (fn) => {
 };
 
 // Start the writer and collect what it reports. With `runMs` the parent checks the lease, lets it run that
-// long and kills it; with `die: [phase, n]` the child kills itself in the middle of a transaction.
+// long and kills it; with `die: [phase, n]` the child kills itself in the middle of a transaction (or, for
+// settle:done, right after one committed: `committed` says the commit was reached).
 async function runWriter(path, { runMs, die } = {}) {
   const child = Bun.spawn(['bun', WRITER, path, ...(die ? [die[0], String(die[1])] : [])], {
     stdout: 'pipe',
     stderr: 'pipe',
   });
   const reported = [];
+  let committed = false;
   let buffer = '';
   let markReady;
   const ready = new Promise((resolve) => {
@@ -66,6 +68,7 @@ async function runWriter(path, { runMs, die } = {}) {
         const line = buffer.slice(0, end);
         buffer = buffer.slice(end + 1);
         if (line === 'ready') markReady();
+        else if (line === 'committed') committed = true;
         else reported.push(line);
       }
     }
@@ -84,7 +87,7 @@ async function runWriter(path, { runMs, die } = {}) {
   }
   await reading;
   const stderr = await new Response(child.stderr).text();
-  return { reported, lease, signal: child.signalCode, stderr };
+  return { reported, committed, lease, signal: child.signalCode, stderr };
 }
 
 const parse = (lines) => lines.map((line) => line.split(' ')).map(([n, d]) => [BigInt(n), d]);
@@ -221,6 +224,70 @@ describe('SqliteStore survives SIGKILL', () => {
       } finally {
         store.close();
       }
+    }
+  }, 60_000);
+
+  // The coordinator completes a round in ONE transaction: the bundle, the phase and the settle job. A crash
+  // must leave all of it or none of it, or a final state could be signed by everyone and never settled.
+  test('a process killed inside the settle transaction leaves none of it; one killed after it, all of it', async () => {
+    const path = join(dir, 'settle.db');
+    const jobKey = `chain-action:${w.tableKey}`;
+    new SqliteStore(path).close(); // an empty file to start from
+    const finalAt = (nonce) => w.stateAt(nonce, { isFinal: true, keep: w.players.map(() => true) });
+
+    // after the 1st write (a player signature) up to the last write before the commit (the job)
+    for (const [phase, at] of [
+      ['settle:1', 1],
+      ['settle:3', 2],
+      ['settle:5', 1],
+      ['settle:6', 2],
+      ['settle:7', 1],
+    ]) {
+      const result = await runWriter(path, { die: [phase, at] });
+      expect(result.signal, result.stderr).toBe('SIGKILL');
+      expect(result.committed, `${phase} was killed after the commit`).toBe(false);
+      const nonce = BigInt(result.reported.at(-1).split(' ')[0]);
+      expect(result.reported).toHaveLength(at);
+
+      const store = new SqliteStore(path);
+      try {
+        expect(store.integrityCheck()).toEqual(['ok']);
+        // the round is exactly as it was before the transaction: reserved and signed by the arbiter, open
+        const round = store.openRound(w.tableKey);
+        expect(round.nonce).toBe(nonce);
+        expect(round.state).toEqual(finalAt(nonce));
+        expect(round.arbiterSig).toBe(w.arbiterSigFor(finalAt(nonce)));
+        expect(round.playerSigs.size).toBe(0);
+        expect(store.loadBundle(w.tableKey)).toBeNull();
+        expect(store.loadFinalBundle(w.tableKey)).toBeNull();
+        expect(store.pendingJobs()).toEqual([]);
+        expect(store.getJob(jobKey)).toBeNull();
+        expect(store.loadTable(w.tableKey).phase).toBe('active');
+      } finally {
+        store.close();
+      }
+    }
+
+    // and the same transaction, left to commit, is all there
+    const done = await runWriter(path, { die: ['settle:done', 1] });
+    expect(done.signal, done.stderr).toBe('SIGKILL');
+    expect(done.committed).toBe(true);
+    const nonce = BigInt(done.reported.at(-1).split(' ')[0]);
+    const store = new SqliteStore(path);
+    try {
+      expect(store.integrityCheck()).toEqual(['ok']);
+      expect(store.loadBundle(w.tableKey)).toEqual(w.bundleFor(finalAt(nonce)));
+      expect(store.loadFinalBundle(w.tableKey)).toEqual(w.bundleFor(finalAt(nonce)));
+      expect(store.openRound(w.tableKey)).toBeNull();
+      expect(store.getJob(jobKey)).toMatchObject({
+        kind: 'settle',
+        status: 'pending',
+        priority: 5,
+      });
+      expect(store.loadTable(w.tableKey).phase).toBe('settling');
+      expect([...store.playerSigs(w.tableKey, nonce).keys()]).toEqual(w.players);
+    } finally {
+      store.close();
     }
   }, 60_000);
 

@@ -218,8 +218,11 @@ describe('a state after a final, and a final that is not mine to sign (C2)', () 
     );
   });
 
-  test('a final state with intent "play" is refused; so is one that keeps my chips when I am leaving', () => {
-    expect(verdict(final, { observed: null, intent: 'play' })).toEqual(refusedBy('C2'));
+  // F13 changed the old expectation here: a final state with intent "play" used to be refused ("you are not
+  // leaving or rotating"). A due rotation rides in a hand-end state the client could not predict, so it is
+  // signed while playing; what is still refused is a final that keeps my chips when I asked to leave.
+  test('a final state is signed while playing; one that keeps my chips is refused when I am leaving', () => {
+    expect(verdict(final, { observed: null, intent: 'play' })).toEqual(yes(final));
     expect(verdict(final, { observed: null, intent: 'leave' })).toEqual(refusedBy('C2')); // keep[me] is true
     const leaves = buildNextState({
       prev: base,
@@ -785,17 +788,50 @@ describe('what an honest client would still sign: design questions, decided', ()
     expect(clientShouldSign(req(hand), view({ maxRakeBps: RAKE_BPS_CEILING }))).toEqual(yes(hand));
   });
 
-  test.todo('REVIEW GAP: intent "rotate" should require keep[me] to match "my balance is above zero"', () => {
-    // NOT FIXED ON PURPOSE: drain, idle and maintenance rotations legitimately pay a seat out; needs a rotation reason in the view.
-    // Today a rotation may pay me out and remove me from the table (keep[me] false) although I never asked
-    // to leave. No funds are lost (the payout goes to my own wallet), but it is an eviction on the server's say-so.
+  // This was a `test.todo` ("intent rotate should require keep[me] to match my balance being above zero",
+  // left open because drain, idle and maintenance rotations legitimately pay a seat out). The F13 redesign
+  // resolves it the other way, on purpose: a cash-out I did not ask for is accepted, because the payout goes
+  // to my own wallet and costs me a re-deposit at worst, never money. What the rotation may NOT do is keep a
+  // seat that cannot play on, or keep me after I asked to leave. Those are the real tests below.
+  test('REVIEW GAP (resolved by F13): an eviction I did not ask for is a cash-out and is signed', () => {
     const evict = buildNextState({
       prev: base,
       balances: base.balances,
       final: true,
       keep: [true, false, true],
     });
-    expect(verdict(evict, { observed: null, intent: 'rotate' }).ok).toBe(false);
+    for (const intent of ['play', 'rotate']) {
+      expect(verdict(evict, { observed: null, intent }), intent).toEqual(yes(evict));
+    }
+    // it is still my money to the unit: skimming a unit off the cashed-out balance is a C1b refusal
+    const skim = shift(evict, ME, 0, 1n);
+    expect(verdict(skim, { observed: null, intent: 'rotate' })).toEqual(refusedBy('C1b'));
+  });
+
+  test('REVIEW GAP (resolved by F13): a rotation may not keep me after I asked to leave, nor keep a seat below one chip', () => {
+    const keepsMe = buildNextState({
+      prev: base,
+      balances: base.balances,
+      final: true,
+      keep: [true, true, true],
+    });
+    expect(verdict(keepsMe, { observed: null, intent: 'leave' })).toEqual(refusedBy('C2'));
+    // ... unless it was already in flight when I pressed Leave (the server had acknowledged this head)
+    expect(verdict(keepsMe, { observed: null, intent: 'leave', leaveAckNonce: 1n })).toEqual(
+      yes(keepsMe),
+    );
+    // dust alone never keeps a seat, mine or anyone's, even in flight
+    const dusty = buildNextState({
+      prev: base,
+      balances: shift(base, 1, 0, base.balances[ME] - 7n).balances,
+      final: true,
+      keep: [true, true, true],
+    });
+    for (const intent of ['play', 'rotate', 'leave']) {
+      const r = verdict(dusty, { observed: null, intent, leaveAckNonce: 9n });
+      expect(r, intent).toEqual(refusedBy('C2'));
+      expect(r.detail).toMatch(/player 1 is kept with less than one chip/);
+    }
   });
 
   test('REVIEW GAP: a yes should hand back the digest to sign, so the caller never signs the server’s copy', () => {
@@ -856,6 +892,7 @@ describe('a hostile server against an honest client over many rounds', () => {
       let highest = -1n;
       let finalSigned = false;
       let accepted = 0;
+      let intentUsed = 'play';
 
       const cumulative = () =>
         truthDeltas.reduce(
@@ -960,6 +997,7 @@ describe('a hostile server against an honest client over many rounds', () => {
           };
 
         const intent = proposal.isFinal ? rng.pick(['play', 'rotate', 'leave']) : 'play';
+        intentUsed = intent;
         let result;
         try {
           result = ask(proposal, { intent });
@@ -979,6 +1017,14 @@ describe('a hostile server against an honest client over many rounds', () => {
           );
         } else {
           expect(finalSigned, 'a state signed after a final').toBe(false);
+          if (proposal.isFinal) {
+            // F13: whatever the intent, no signed final keeps a seat below one chip, and a leaver is not kept
+            expect(
+              proposal.keep.some((kept, i) => kept && proposal.balances[i] < UNIT),
+              'a seat below one chip was kept',
+            ).toBe(false);
+            if (intentUsed === 'leave') expect(proposal.keep[me], 'a leaver was kept').toBe(false);
+          }
           expect(proposal.nonce > BigInt(highest), 'the nonce went back').toBe(true);
           expect(proposal.nonce, 'the nonce skipped ahead').toBe(nextNonce);
           signedByNonce.set(proposal.nonce, digest);

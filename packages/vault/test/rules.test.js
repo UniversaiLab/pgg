@@ -233,6 +233,165 @@ describe('C1b: every amount moves by what the client saw', () => {
   });
 });
 
+describe('C1b when the pot is unknown (observed.pot = null: the hand was not watched live)', () => {
+  // The client only knows the public stacks, so balances and rake are still exact; the volume need only not
+  // go down, and the cumulative cap (C1e) still binds.
+  const unwatched = (over = {}) => ({ deltas: [98, -100, 0], rake: 2, pot: null, ...over });
+  const withVolume = (state, volume) => move(state, { volume });
+  const rich = { ...base, volume: 1000n * UNIT }; // a baseline that already has volume
+
+  test('the honest state is signed whatever volume fits the cap (the pot is not compared)', () => {
+    // 2 chips of rake need at least 40 chips of volume at 500 bps
+    for (const volume of [hand.volume, 40n * UNIT, 41n * UNIT, 10_000n * UNIT, 10n ** 30n]) {
+      expect(
+        clientShouldSign(req(withVolume(hand, volume)), view({ observed: unwatched() })),
+        String(volume),
+      ).toEqual(signs(withVolume(hand, volume)));
+    }
+  });
+
+  test('with a known pot the volume is still exact (a number is not null)', () => {
+    const inflated = withVolume(hand, hand.volume + UNIT);
+    expect(clientShouldSign(req(inflated), view())).toEqual(refused('C1b'));
+    expect(clientShouldSign(req(inflated), view({ observed: unwatched() }))).toEqual(
+      signs(inflated),
+    );
+  });
+
+  test('a hostile volume that goes down is refused (C1b), even though no pot is known', () => {
+    const next = w.nextHand(rich, {
+      winner: 0,
+      loser: 1,
+      amount: 100n * UNIT,
+      rake: 2n * UNIT,
+      pot: 200n * UNIT,
+    });
+    const v = view({ baseline: rich, observed: unwatched() });
+    expect(clientShouldSign(req(next), v)).toEqual(signs(next));
+    // one token unit below the baseline's volume, and a whole chip below it
+    for (const volume of [rich.volume - 1n, rich.volume - UNIT]) {
+      const r = clientShouldSign(req(withVolume(next, volume)), v);
+      expect(r, String(volume)).toEqual(refused('C1b'));
+      expect(r.detail).toMatch(/volume went down/);
+    }
+    // a volume of zero is below the cap for the rake that was taken: C1e speaks first
+    expect(clientShouldSign(req(withVolume(next, 0n)), v)).toEqual(refused('C1e'));
+    // the same volume as the baseline (no hand volume at all) is not downwards
+    expect(clientShouldSign(req(withVolume(next, rich.volume)), v)).toEqual(
+      signs(withVolume(next, rich.volume)),
+    );
+  });
+
+  test('a volume that is just enough to justify extra rake does not make the extra rake legal', () => {
+    // a tiny hand: seat 1 loses 2 chips to seat 0, no rake. The server takes 1 chip of rake from the
+    // winner and inflates the volume to exactly the 20 chips that make 1 chip of rake legal at 500 bps.
+    const seenSmall = { deltas: [2, -2, 0], rake: 0, pot: null };
+    const honest = w.nextHand(base, { amount: 2n * UNIT, rake: 0n, pot: 4n * UNIT });
+    expect(clientShouldSign(req(honest), view({ observed: seenSmall }))).toEqual(signs(honest));
+    const skim = (volume) =>
+      move(withBalance(honest, 0, -UNIT), { rake: UNIT, volume: base.volume + volume });
+    // the cap is exactly met: C1e passes, and the skimmed seat is what gives it away
+    const r = clientShouldSign(req(skim(20n * UNIT)), view({ observed: seenSmall }));
+    expect(r).toEqual(refused('C1b'));
+    expect(r.detail).toMatch(/player 0/);
+    // one token unit less volume and the cap itself refuses
+    expect(clientShouldSign(req(skim(20n * UNIT - 1n)), view({ observed: seenSmall }))).toEqual(
+      refused('C1e'),
+    );
+    // a ledger that is wrong about the rake is caught on the rake line, whatever the volume
+    const wrongRake = clientShouldSign(
+      req(skim(20n * UNIT)),
+      view({ observed: { deltas: [1, -2, 0], rake: 0, pot: null } }),
+    );
+    expect(wrongRake).toEqual(refused('C1b'));
+    expect(wrongRake.detail).toMatch(/rake moves by/);
+  });
+
+  test('conservation and the cumulative cap are checked with an unknown pot too', () => {
+    expect(
+      clientShouldSign(req(withBalance(hand, 2, UNIT)), view({ observed: unwatched() })),
+    ).toEqual(refused('C1c'));
+    // 2 chips of rake against 39 chips of volume is above 500 bps
+    expect(
+      clientShouldSign(req(withVolume(hand, 39n * UNIT)), view({ observed: unwatched() })),
+    ).toEqual(refused('C1e'));
+    expect(clientShouldSign(req(hand), view({ observed: unwatched(), maxRakeBps: 99 }))).toEqual(
+      refused('C1e'),
+    );
+  });
+
+  test('a volume so large that the contract would panic on the cap check is refused (C1e)', () => {
+    const cap = (1n << 256n) - 1n;
+    const biggest = cap / 500n; // 500 * biggest still fits in a uint256
+    expect(
+      clientShouldSign(req(withVolume(hand, biggest)), view({ observed: unwatched() })),
+    ).toEqual(signs(withVolume(hand, biggest)));
+    for (const volume of [biggest + 1n, cap]) {
+      const r = clientShouldSign(req(withVolume(hand, volume)), view({ observed: unwatched() }));
+      expect(r, String(volume)).toEqual(refused('C1e'));
+      expect(r.detail).toMatch(/panic/);
+    }
+    // the product may reach exactly 2^256 - 1 without a panic (1 bps of 2^256 - 1), and not one more (2 bps)
+    const atCap = withVolume(hand, cap);
+    expect(clientShouldSign(req(atCap), view({ observed: unwatched(), maxRakeBps: 1 }))).toEqual(
+      signs(atCap),
+    );
+    const over = clientShouldSign(req(atCap), view({ observed: unwatched(), maxRakeBps: 2 }));
+    expect(over).toEqual(refused('C1e'));
+    expect(over.detail).toMatch(/panic/);
+    // the same on the rake side: rake * 10000 overflows
+    const r = clientShouldSign(
+      req(move(hand, { rake: 1n << 250n, volume: biggest })),
+      view({ observed: unwatched() }),
+    );
+    expect(r).toEqual(refused('C1e'));
+    expect(r.detail).toMatch(/panic/);
+  });
+
+  test('the volume is judged against the state I signed when it is newer than the baseline', () => {
+    const second = w.nextHand(hand, {
+      winner: 2,
+      loser: 0,
+      amount: 10n * UNIT,
+      rake: UNIT,
+      pot: 20n * UNIT,
+    });
+    const v = view({
+      last: { ...record(hand), state: hand },
+      observed: { deltas: [-10, 0, 9], rake: 1, pot: null },
+    });
+    expect(clientShouldSign(req(second), v)).toEqual(signs(second));
+    expect(clientShouldSign(req(withVolume(second, hand.volume - 1n)), v)).toEqual(refused('C1b'));
+  });
+
+  test('a final state with an unknown pot is judged the same way', () => {
+    const folded = buildNextState({
+      prev: base,
+      balances: hand.balances,
+      rakeDelta: 2n * UNIT,
+      volumeDelta: 300n * UNIT,
+      final: true,
+      keep: [true, true, true],
+    });
+    expect(clientShouldSign(req(folded), view({ observed: unwatched() }))).toEqual(signs(folded));
+  });
+
+  test('null is the only way to say "unknown": a missing pot is a broken ledger (VIEW)', () => {
+    for (const pot of [undefined, 'null', NaN, -1, 1.5, '200']) {
+      const observed = { deltas: [98, -100, 0], rake: 2, pot };
+      expect(clientShouldSign(req(), view({ observed })), String(pot)).toEqual(refused('VIEW'));
+    }
+    const noPot = { deltas: [98, -100, 0], rake: 2 };
+    expect(clientShouldSign(req(), view({ observed: noPot }))).toEqual(refused('VIEW'));
+  });
+
+  test('no observed hand at all (null) is not "unknown": it means nothing happened, and the pot is 0', () => {
+    expect(clientShouldSign(req(), view({ observed: null }))).toEqual(refused('C1b'));
+    const quiet = buildNextState({ prev: base, balances: base.balances, volumeDelta: UNIT });
+    expect(clientShouldSign(req(quiet), view({ observed: null }))).toEqual(refused('C1b'));
+  });
+});
+
 describe('C1c: conservation against the last all-signed baseline', () => {
   test('chips created out of nothing are refused', () => {
     const r = clientShouldSign(req(withBalance(hand, 2, UNIT)), view());
@@ -407,11 +566,49 @@ describe('C2: final states', () => {
   const finalOf = (keep) =>
     buildNextState({ prev: base, balances: base.balances, final: true, keep });
   const leave = finalOf([true, false, true]);
+  // seat 0 is down to `left` token units (less than one chip) and everything else sits with seat 1
+  const withLeft = (left, keep) =>
+    buildNextState({
+      prev: base,
+      balances: [left, base.balances[1] + base.balances[0] - left, base.balances[2]],
+      final: true,
+      keep,
+    });
+  const keepsDust = (left = 5n) => withLeft(left, [true, true, true]);
 
-  test('a final state is refused when the client is not leaving or rotating', () => {
+  // F13: the old rule ("a final state needs intent leave or rotate") is gone. A due rotation is folded into
+  // a hand-end state the client could not have predicted, so it must be signable while playing.
+  test('a final state is signed while playing: no intent of its own is needed', () => {
     expect(clientShouldSign(req(leave), view({ observed: null, intent: 'play' }))).toEqual(
-      refused('C2'),
+      signs(leave),
     );
+    for (const keep of [
+      [true, true, true],
+      [false, false, false],
+      [true, false, true],
+      [false, true, false],
+    ]) {
+      expect(
+        clientShouldSign(req(finalOf(keep)), view({ observed: null, intent: 'play' })),
+        String(keep),
+      ).toEqual(signs(finalOf(keep)));
+    }
+  });
+
+  test('"rotate" is an alias of "play": the verdict is the same for every final and every refusal', () => {
+    const cases = [
+      [leave, { observed: null }],
+      [finalOf([true, true, true]), { observed: null }],
+      [keepsDust(), { observed: null }], // refused by C2 whatever the intent
+      [hand, {}],
+      [move(hand, { isFinal: true, keep: [true, true, true] }), {}],
+      [withBalance(hand, 2, UNIT), {}],
+    ];
+    for (const [state, over] of cases) {
+      expect(clientShouldSign(req(state), view({ ...over, intent: 'rotate' }))).toEqual(
+        clientShouldSign(req(state), view({ ...over, intent: 'play' })),
+      );
+    }
   });
 
   test('a leaving player signs a final state that pays them out', () => {
@@ -498,6 +695,212 @@ describe('C2: final states', () => {
   });
 });
 
+describe('C2 (F13): leaving, states already in flight, and seats too small to keep', () => {
+  const finalOf = (keep, prev = base) =>
+    buildNextState({ prev, balances: prev.balances, final: true, keep });
+  const keepsMe = finalOf([true, true, true]); // nonce 1; keep[ME] is true
+  const releasesMe = finalOf([true, false, true]);
+  const leaving = (over = {}) => view({ observed: null, intent: 'leave', ...over });
+  const playing = (over = {}) => view({ observed: null, intent: 'play', ...over });
+  const withLeft = (left, keep, prev = base) =>
+    buildNextState({
+      prev,
+      balances: prev.balances.map((b, i) =>
+        i === 0 ? left : i === 1 ? b + prev.balances[0] - left : b,
+      ),
+      final: true,
+      keep,
+    });
+
+  describe('(a) when I asked to leave, a final must not keep me, except states in flight at the press', () => {
+    test('with no acknowledged head, keep[me] is refused at any nonce, and a release is signed', () => {
+      for (const leaveAckNonce of [undefined, null]) {
+        const r = clientShouldSign(req(keepsMe), leaving({ leaveAckNonce }));
+        expect(r).toEqual(refused('C2'));
+        expect(r.detail).toMatch(/keeps your chips/);
+      }
+      expect(clientShouldSign(req(releasesMe), leaving())).toEqual(signs(releasesMe));
+    });
+
+    test('a state at or below leaveAckNonce may keep me: I sign it and leave() in Filling', () => {
+      for (const leaveAckNonce of [1n, 2n, 1, 2, 1_000_000n]) {
+        expect(
+          clientShouldSign(req(keepsMe), leaving({ leaveAckNonce })),
+          String(leaveAckNonce),
+        ).toEqual(signs(keepsMe));
+      }
+    });
+
+    test('a state above leaveAckNonce must let me go: the boundary is exact', () => {
+      expect(keepsMe.nonce).toBe(1n);
+      for (const leaveAckNonce of [0n, 0]) {
+        expect(clientShouldSign(req(keepsMe), leaving({ leaveAckNonce }))).toEqual(refused('C2'));
+      }
+      // one state later: the head acknowledged at the press was 1, this is nonce 2
+      const second = finalOf([true, true, true], hand);
+      expect(second.nonce).toBe(2n);
+      const next = (leaveAckNonce) => leaving({ baseline: hand, leaveAckNonce });
+      expect(clientShouldSign(req(second), next(1n))).toEqual(refused('C2'));
+      expect(clientShouldSign(req(second), next(2n))).toEqual(signs(second));
+    });
+
+    test('keep[me] = false is signed whatever leaveAckNonce says', () => {
+      for (const leaveAckNonce of [undefined, 0n, 1n, 50n]) {
+        expect(clientShouldSign(req(releasesMe), leaving({ leaveAckNonce }))).toEqual(
+          signs(releasesMe),
+        );
+      }
+    });
+
+    test('leaveAckNonce only matters to a leaver: while playing it changes nothing', () => {
+      for (const leaveAckNonce of [undefined, 0n, 7n]) {
+        expect(clientShouldSign(req(keepsMe), playing({ leaveAckNonce }))).toEqual(signs(keepsMe));
+        expect(
+          clientShouldSign(req(keepsMe), playing({ leaveAckNonce, intent: 'rotate' })),
+        ).toEqual(signs(keepsMe));
+      }
+    });
+
+    test('an in-flight state is excused from the leave rule and from nothing else', () => {
+      const inFlight = (state, over = {}) =>
+        clientShouldSign(req(state), leaving({ leaveAckNonce: 5n, ...over }));
+      expect(inFlight(keepsMe)).toEqual(signs(keepsMe));
+      // C1d, C1a, the money and the keep rules all still apply
+      expect(inFlight(move(keepsMe, { tableId: `0x${'ab'.repeat(32)}` }))).toEqual(refused('C1d'));
+      expect(inFlight(move(keepsMe, { nonce: 3n }))).toEqual(refused('C1a')); // skips ahead of the baseline
+      expect(inFlight(withBalance(withBalance(keepsMe, 0, UNIT), 2, -UNIT))).toEqual(
+        refused('C1b'),
+      );
+      expect(inFlight(withBalance(keepsMe, 0, UNIT))).toEqual(refused('C1c'));
+      expect(inFlight(move(keepsMe, { isFinal: false }))).toEqual(refused('C2')); // keep flags, not final
+      expect(inFlight(withLeft(0n, [true, true, true]))).toEqual(refused('C2')); // BadKeep still
+      expect(inFlight(withLeft(5n, [true, true, true]))).toEqual(refused('C2')); // dust still
+      // and the one after a final in this epoch
+      const signedFinal = { ...record(keepsMe, true), state: keepsMe };
+      const after = w.nextHand(keepsMe);
+      expect(
+        clientShouldSign(
+          req(after),
+          leaving({ baseline: keepsMe, last: signedFinal, leaveAckNonce: 5n }),
+        ),
+      ).toEqual(refused('C2'));
+    });
+
+    test('a bad leaveAckNonce is a VIEW error, not a guess', () => {
+      for (const bad of [-1n, -1, 1.5, '1', true, Number.NaN, {}, []]) {
+        expect(
+          clientShouldSign(req(keepsMe), leaving({ leaveAckNonce: bad })),
+          String(bad),
+        ).toEqual(refused('VIEW'));
+      }
+    });
+
+    test('a leaver is not asked about a seat that is not theirs: other seats may be kept', () => {
+      const keepsOthers = finalOf([true, false, true]);
+      expect(clientShouldSign(req(keepsOthers), leaving())).toEqual(signs(keepsOthers));
+    });
+  });
+
+  describe('(b) no seat with less than one chip is kept: dust alone never keeps a seat', () => {
+    test('a kept seat below one chip is refused, from one token unit up to unit - 1', () => {
+      for (const left of [0n, 1n, 5n, UNIT / 2n, UNIT - 1n]) {
+        const r = clientShouldSign(req(withLeft(left, [true, true, true])), playing());
+        expect(r, String(left)).toEqual(refused('C2'));
+        expect(r.detail, String(left)).toMatch(left === 0n ? /BadKeep/ : /less than one chip/);
+        expect(r.detail).toMatch(/player 0/);
+      }
+    });
+
+    test('exactly one chip, and more, may be kept', () => {
+      // whole chips moved from seat 0 to seat 1, observed exactly: the state is signed outright
+      for (const chipsLeft of [1n, 2n, 40n]) {
+        const state = withLeft(chipsLeft * UNIT, [true, true, true]);
+        const moved = Number(chipsLeft - base.balances[0] / UNIT);
+        const observed = { deltas: [moved, -moved, 0], rake: 0, pot: 0 };
+        expect(clientShouldSign(req(state), playing({ observed })), String(chipsLeft)).toEqual(
+          signs(state),
+        );
+      }
+      // one unit above a chip is still not C2's business (the money rules judge the rest)
+      const state = withLeft(UNIT + 1n, [true, true, true]);
+      expect(clientShouldSign(req(state), playing())).toEqual(refused('C1b'));
+    });
+
+    test('a seat below one chip that is not kept is fine: it is paid out', () => {
+      const state = withLeft(5n, [false, true, true]);
+      expect(clientShouldSign(req(state), playing()).rule).not.toBe('C2');
+      const nobody = withLeft(5n, [false, false, false]);
+      expect(clientShouldSign(req(nobody), playing()).rule).not.toBe('C2');
+    });
+
+    test('it binds every seat, mine and the others, whatever the intent and whatever leaveAckNonce', () => {
+      const dustAt = (i, keep) =>
+        buildNextState({
+          prev: base,
+          balances: base.balances.map((b, j) =>
+            j === i ? 3n : j === (i + 1) % 3 ? b + base.balances[i] - 3n : b,
+          ),
+          final: true,
+          keep,
+        });
+      for (const seat of [0, 1, 2]) {
+        const keep = [false, false, false];
+        keep[seat] = true;
+        const state = dustAt(seat, keep);
+        for (const intent of ['play', 'rotate', 'leave']) {
+          const r = clientShouldSign(
+            req(state),
+            view({ observed: null, intent, leaveAckNonce: 9n }),
+          );
+          expect(r, `${seat} ${intent}`).toEqual(refused('C2'));
+          expect(r.detail).toMatch(new RegExp(`player ${seat}`));
+        }
+      }
+    });
+
+    test('it is checked against the unit in the view, not a fixed one', () => {
+      const state = withLeft(UNIT, [true, true, true]);
+      expect(clientShouldSign(req(state), playing({ unit: UNIT })).rule).not.toBe('C2');
+      const r = clientShouldSign(req(state), playing({ unit: UNIT + 1n }));
+      expect(r).toEqual(refused('C2'));
+    });
+  });
+
+  describe('(c) a cash-out I did not ask for is accepted: it is never a loss', () => {
+    test('keep[me] = false while playing or rotating is signed (this closes the old "rotate" test.todo)', () => {
+      const evict = finalOf([true, false, true]);
+      for (const intent of ['play', 'rotate']) {
+        expect(clientShouldSign(req(evict), view({ observed: null, intent }))).toEqual(
+          signs(evict),
+        );
+      }
+      const everyone = finalOf([false, false, false]);
+      expect(clientShouldSign(req(everyone), playing())).toEqual(signs(everyone));
+    });
+
+    test('the cash-out still has to be my money: the balance rules apply to it', () => {
+      const evict = finalOf([true, false, true]);
+      const robbed = withBalance(withBalance(evict, ME, -UNIT), 2, UNIT);
+      expect(clientShouldSign(req(robbed), playing())).toEqual(refused('C1b'));
+      expect(clientShouldSign(req(withBalance(evict, ME, -UNIT)), playing())).toEqual(
+        refused('C1c'),
+      );
+    });
+
+    test('a rotation folded into a hand-end state: the hand is checked, the keep flags are free', () => {
+      const folded = buildNextState({
+        prev: base,
+        balances: hand.balances,
+        rakeDelta: 2n * UNIT,
+        volumeDelta: 200n * UNIT,
+        final: true,
+        keep: [true, false, true],
+      });
+      expect(clientShouldSign(req(folded), view())).toEqual(signs(folded));
+    });
+  });
+});
+
 describe('malformed requests and views are refused, never thrown', () => {
   test('MALFORMED: a request that is not a State', () => {
     for (const state of [
@@ -572,9 +975,11 @@ describe('rule ordering', () => {
     );
     expect(r).toEqual(refused('C1a'));
   });
-  test('C2 (not leaving) before the money', () => {
-    const final = move(withBalance(hand, 2, UNIT), { isFinal: true });
-    expect(clientShouldSign(req(final), view())).toEqual(refused('C2'));
+  test('C2 (a final that keeps a leaver) before the money', () => {
+    const final = move(withBalance(hand, 2, UNIT), { isFinal: true, keep: [false, true, false] });
+    expect(clientShouldSign(req(final), view({ intent: 'leave' }))).toEqual(refused('C2'));
+    // the same state with a seat that may be kept is no longer a C2 problem: the money is what fails
+    expect(clientShouldSign(req(final), view({ intent: 'play' }))).toEqual(refused('C1c'));
   });
   test('C1e before C1c before C1b', () => {
     expect(clientShouldSign(req(withBalance(hand, 2, UNIT)), view({ maxRakeBps: 1 }))).toEqual(

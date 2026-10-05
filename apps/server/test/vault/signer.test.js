@@ -114,6 +114,15 @@ describe('LocalKeySigner', () => {
     expect(() => signer.signReserved(5, 7n)).toThrow(TypeError);
   });
 
+  test('nonce 0 is a nonce like any other: the store decides what is reserved, the signer does not second-guess it', () => {
+    const store = makeStore();
+    const signer = new LocalKeySigner({ privateKey: KEY, reserved: store.reserved });
+    expect(() => signer.signReserved(TABLE, 0n)).toThrow(/nothing is reserved/);
+    store.reserve(TABLE, 0n, DIGEST_5);
+    expect(recoverSigner(DIGEST_5, signer.signReserved(TABLE, 0n))).toBe(signer.address);
+    expect(recoverSigner(DIGEST_5, signer.signReserved(TABLE, 0))).toBe(signer.address);
+  });
+
   test('refuses to sign something that is not a digest, even if the store returns it', () => {
     for (const junk of [
       '0x1234',

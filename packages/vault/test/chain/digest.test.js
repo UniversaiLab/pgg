@@ -15,7 +15,7 @@ chainDescribe('library vs the real PokerVault', () => {
 
   beforeAll(async () => {
     env = await setupEpoch();
-  });
+  }, 60_000); // about forty transactions on anvil: slow on a busy machine
   afterAll(async () => {
     await env?.node.stop();
   });

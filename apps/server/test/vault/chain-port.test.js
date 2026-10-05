@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import {
   assertChainPort,
   assertJob,
@@ -166,9 +167,10 @@ describe('assertJob', () => {
     expect(() => assertJob({ ...job, tableKey: T.toUpperCase().replace('0X', '0x') })).toThrow(
       /tableKey/,
     );
-    expect(() => assertJob(null)).toThrow(TypeError);
-    expect(() => assertJob('job')).toThrow(TypeError);
-    expect(() => assertJob(undefined)).toThrow(TypeError);
+    for (const notAJob of [null, 'job', undefined, 5, true]) {
+      expect(() => assertJob(notAJob)).toThrow(TypeError);
+      expect(() => assertJob(notAJob)).toThrow(/job must be an object/);
+    }
   });
 });
 
@@ -271,5 +273,36 @@ describe('assertChainPort', () => {
     expect(() => assertChainPort(null)).toThrow(TypeError);
     expect(() => assertChainPort(undefined)).toThrow(TypeError);
     expect(() => assertChainPort('chain')).toThrow(TypeError);
+  });
+});
+
+// Ground rules for everything the TableActor's vault layer sits on: synchronous (no awaiting inside a method
+// the actor calls) and no wall clock or randomness (an NTP step must not fire an exit early, and a test must
+// be able to replay a run). A scan is blunt but it fails the moment someone adds one.
+describe('the chain-side vault files obey the ground rules', () => {
+  const FILES = ['chain-port', 'fake-chain', 'reconcile', 'signer', 'null-wallet'];
+  const code = (name) =>
+    readFileSync(new URL(`../../src/vault/${name}.js`, import.meta.url), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/.*$/gm, '');
+
+  test('no Date.now, no Math.random, no timers, no async or await', () => {
+    for (const name of FILES) {
+      const source = code(name);
+      expect(source).not.toMatch(/\bDate\b/);
+      expect(source).not.toMatch(/\bperformance\b/);
+      expect(source).not.toMatch(/Math\.random/);
+      expect(source).not.toMatch(/\b(setTimeout|setInterval|setImmediate|queueMicrotask)\b/);
+      expect(source).not.toMatch(/\b(async|await)\b/);
+      expect(source).not.toMatch(/\bPromise\b/);
+    }
+  });
+
+  test('the scan sees code: the files it reads are not empty and do contain what they should', () => {
+    expect(code('fake-chain')).toMatch(/class FakeChain/);
+    expect(code('reconcile')).toMatch(/export function nextChainAction/);
+    expect(code('signer')).toMatch(/class LocalKeySigner/);
+    expect(code('null-wallet')).toMatch(/class NullWallet/);
+    expect(code('chain-port')).toMatch(/export const JOB_KINDS/);
   });
 });

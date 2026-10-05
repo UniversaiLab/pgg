@@ -25,6 +25,53 @@ import { toChips, toTokenUnits } from '../src/units.js';
 import { makeWorld, UNIT } from './fixtures.js';
 import { makeRng, randomRoster, randomState, UINT64_MAX, UINT256_MAX } from './gen.js';
 
+// "Does not walk the input" is proved two ways, because a wall clock alone flakes on a busy machine: (1) an
+// array that records every property read, which is deterministic, and (2) a cost that must not grow with the
+// length, compared against a small input measured the same way a moment earlier (best of several runs).
+function recordingArray(length) {
+  const touched = [];
+  const proxy = new Proxy(new Array(length), {
+    get(target, key, receiver) {
+      if (key !== 'length') touched.push(`get ${String(key)}`);
+      return Reflect.get(target, key, receiver);
+    },
+    has(target, key) {
+      touched.push(`has ${String(key)}`);
+      return Reflect.has(target, key);
+    },
+    ownKeys(target) {
+      touched.push('ownKeys');
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, key) {
+      touched.push(`descriptor ${String(key)}`);
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  return { proxy, touched };
+}
+
+const bestMillis = (fn, samples = 7) => {
+  let best = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < samples; i++) {
+    const started = performance.now();
+    fn();
+    best = Math.min(best, performance.now() - started);
+  }
+  return best;
+};
+
+// The call on `huge` may cost at most 10 times the same call on `small`, plus a floor that absorbs timer
+// noise. Walking the huge input would cost about 1000 times more (the sizes differ by that much).
+const expectCostIndependentOfSize = (small, huge, call) => {
+  const run = (input) => () => {
+    for (let i = 0; i < 20; i++) call(input);
+  };
+  const smallCost = bestMillis(run(small));
+  const hugeCost = bestMillis(run(huge));
+  expect(hugeCost, `small ${smallCost} ms, huge ${hugeCost} ms`).toBeLessThan(smallCost * 10 + 5);
+};
+
 const addr = (n) => `0x${n.toString(16).padStart(40, '0')}`;
 const TABLE = `0x${'ab'.repeat(32)}`;
 const wire = (patch = {}) => ({
@@ -118,10 +165,17 @@ describe('fromWire: decimal strings, and nothing else', () => {
   });
 
   test('a very long string is refused quickly, before anything is parsed', () => {
-    const started = performance.now();
     expect(() => fromWire(wire({ nonce: '1'.repeat(5_000_000) }))).toThrow(RangeError);
     expect(() => fromWire(wire({ rake: `${'1'.repeat(5_000_000)}x` }))).toThrow(RangeError);
-    expect(performance.now() - started).toBeLessThan(500);
+    // the refusal costs the same for 100 characters as for 5 million: nothing parses the string first
+    const refuse = (text) => {
+      try {
+        fromWire(wire({ nonce: text, rake: `${text}x` }));
+      } catch {
+        // refused, as the test above proves; only the cost matters here
+      }
+    };
+    expectCostIndependentOfSize('1'.repeat(100), '1'.repeat(5_000_000), refuse);
   });
 
   test('anything that is not a string is refused, including every other way to spell a number', () => {
@@ -367,15 +421,25 @@ describe('normalizeState: ranges, rosters and addresses', () => {
       expect(() => normalizeState(v)).toThrow(RangeError);
   });
 
-  test('200 thousand players are refused, and quickly enough that a hostile peer cannot park the CPU', () => {
+  test('200 thousand players are refused without reading one of them, so a hostile peer cannot park the CPU', () => {
     const players = Array.from({ length: 200_000 }, (_, i) => addr(BigInt(i + 1)));
-    const started = performance.now();
-    expect(() =>
-      fromWire(wire({ players, balances: players.map(() => '1'), keep: players.map(() => false) })),
-    ).toThrow(/players/);
-    // 200k entries took roughly 100 ms when this was written: the whole array is mapped before the
-    // length is looked at. Not a bug by itself; this bounds it so a regression to something quadratic shows.
-    expect(performance.now() - started).toBeLessThan(2000);
+    const balances = players.map(() => '1');
+    const keep = players.map(() => false);
+    expect(() => fromWire(wire({ players, balances, keep }))).toThrow(/players/);
+    // the length is looked at before any element, whatever the field
+    for (const field of ['players', 'balances', 'keep']) {
+      const { proxy, touched } = recordingArray(200_000);
+      expect(() => fromWire(wire({ [field]: proxy })), field).toThrow(RangeError);
+      expect(touched, `${field} was read`).toEqual([]);
+    }
+    const refuse = (list) => {
+      try {
+        fromWire(wire({ players: list, balances, keep }));
+      } catch {
+        // refused, as above
+      }
+    };
+    expectCostIndependentOfSize(players.slice(0, 2_000), players, refuse);
   });
 });
 
@@ -573,15 +637,61 @@ describe('over-long arrays are refused before anything walks them', () => {
   const huge = (n) => new Array(n).fill('1');
 
   test('fromWire on 2 million entries is one comparison, not 2 million conversions', () => {
-    const started = performance.now();
-    for (const field of ['players', 'balances', 'keep']) {
-      expect(() => fromWire(wire({ [field]: huge(2_000_000) })), field).toThrow(RangeError);
-    }
     const sparse = new Array(2_000_000); // would cost a full scan for holes if the length came second
     for (const field of ['players', 'balances', 'keep']) {
+      expect(() => fromWire(wire({ [field]: huge(2_000_000) })), field).toThrow(RangeError);
       expect(() => fromWire(wire({ [field]: sparse })), field).toThrow(RangeError);
     }
-    expect(performance.now() - started).toBeLessThan(250);
+    // the cost must not grow with the length (the old absolute 250 ms bound failed on a busy machine)
+    const refuseAll = (list) => {
+      for (const field of ['players', 'balances', 'keep']) {
+        try {
+          fromWire(wire({ [field]: list }));
+        } catch {
+          // refused, as above
+        }
+      }
+    };
+    expectCostIndependentOfSize(huge(2_000), huge(2_000_000), refuseAll);
+    expectCostIndependentOfSize(new Array(2_000), sparse, refuseAll);
+  });
+
+  test('the length check comes before any element is read: no clock needed (fromWire and normalizeState)', () => {
+    for (const length of [11, 2_000_000]) {
+      for (const field of ['players', 'balances', 'keep']) {
+        const wireRead = recordingArray(length);
+        expect(() => fromWire(wire({ [field]: wireRead.proxy })), `fromWire ${field}`).toThrow(
+          RangeError,
+        );
+        expect(wireRead.touched, `fromWire read ${field}`).toEqual([]);
+
+        const stateRead = recordingArray(length);
+        expect(
+          () => normalizeState(internal({ [field]: stateRead.proxy })),
+          `normalizeState ${field}`,
+        ).toThrow(RangeError);
+        expect(stateRead.touched, `normalizeState read ${field}`).toEqual([]);
+      }
+    }
+    // a getter-instrumented real array of 11: also refused without a single element read
+    let reads = 0;
+    const eleven = new Array(11).fill('1');
+    for (let i = 0; i < eleven.length; i++) {
+      Object.defineProperty(eleven, i, {
+        get() {
+          reads++;
+          return '1';
+        },
+      });
+    }
+    for (const field of ['players', 'balances', 'keep']) {
+      expect(() => fromWire(wire({ [field]: eleven })), field).toThrow(RangeError);
+    }
+    expect(reads).toBe(0);
+    // and an array of exactly 10 IS read, so the recorder is not simply blind
+    const ten = recordingArray(10);
+    expect(() => fromWire(wire({ players: ten.proxy }))).toThrow(RangeError);
+    expect(ten.touched.length).toBeGreaterThan(0);
   });
 
   test('normalizeState too, and the limit is the table size: 10 passes, 11 does not', () => {

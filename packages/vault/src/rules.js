@@ -12,6 +12,7 @@
 // The predicates never throw on bad input: a request they cannot make sense of is a refusal, and a deal
 // they cannot confirm is a "no". The shapes of `req` and `view` are documented in README.md.
 import { EXPECT_ERRORS, verifyBundle } from './bundle.js';
+import { UINT256_MAX } from './bytes.js';
 import { RAKE_BPS_CEILING } from './check.js';
 import { domainsEqual, hashState, normalizeDomain } from './eip712.js';
 import { normalizeAddress, normalizeState } from './state.js';
@@ -22,7 +23,7 @@ export const RULES = Object.freeze({
   C1c: 'Balances plus rake must add up to what the last state you hold (the one you signed, if newer) held.',
   C1d: 'Same table, same roster, same domain as pinned; the digest is yours to compute, and the one you sign.',
   C1e: 'Rake never decreases and never exceeds the vault cap of the volume.',
-  C2: 'Sign a final state only when you are leaving or rotating, nothing at all after one in the epoch, and no keep flag in a state that is not final.',
+  C2: 'Sign nothing after a final in the epoch. A final state is otherwise fine, unless you asked to leave and it keeps you (states the server had already proposed when you pressed Leave are signed, and you leave in Filling), or it keeps a seat with less than one chip; no keep flag in a state that is not final. A final that cashes you out when you did not ask is accepted.',
   S1: 'Do not deal the next hand before the last state has every signature, verified for this table and domain.',
   S3: 'Do not co-sign with a session key past its policy expiry.',
   S4: 'Never sign two states with the same nonce (decideSign, on the arbiter side).',
@@ -30,6 +31,8 @@ export const RULES = Object.freeze({
 
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
+// 'rotate' is an alias of 'play': a final state is judged the same either way (F13), so a due rotation needs
+// no intent of its own. It stays accepted so a caller written against the first design keeps working.
 const INTENTS = ['play', 'leave', 'rotate'];
 
 const nonceOf = (value, field) => {
@@ -107,6 +110,11 @@ function readView(view) {
   if (view.myBalance !== undefined && (typeof view.myBalance !== 'bigint' || view.myBalance < 0n)) {
     throw new RangeError('myBalance must be a non-negative bigint (token base units)');
   }
+  // the head nonce the server had acknowledged when I pressed Leave: null (or absent) means I did not
+  const leaveAckNonce =
+    view.leaveAckNonce === undefined || view.leaveAckNonce === null
+      ? null
+      : nonceOf(view.leaveAckNonce, 'leaveAckNonce');
   let last = null;
   if (view.last !== null && view.last !== undefined) {
     last = {
@@ -123,6 +131,9 @@ function readView(view) {
   if (!Array.isArray(seen.deltas) || seen.deltas.length !== roster.length) {
     throw new RangeError('observed.deltas must have one entry per roster seat');
   }
+  // pot is null when the client did not watch the hand live and only knows the public stacks. Only an
+  // explicit null counts: a missing pot is a broken ledger, and a broken ledger must not skip the volume check.
+  const pot = seen.pot === null ? null : chips(seen.pot, 'observed.pot');
   return {
     me: normalizeAddress(view.me, 'me'),
     domain: normalizeDomain(view.domain),
@@ -132,13 +143,14 @@ function readView(view) {
     maxRakeBps: BigInt(view.maxRakeBps),
     maxNonceGap: gapOf(view.maxNonceGap),
     myBalance: view.myBalance ?? null,
+    leaveAckNonce,
     baseline,
     last,
     intent: view.intent,
     observed: {
       deltas: seen.deltas.map((d, i) => chips(d, `observed.deltas[${i}]`)),
       rake: chips(seen.rake, 'observed.rake'),
-      pot: chips(seen.pot, 'observed.pot'),
+      pot,
     },
   };
 }
@@ -158,12 +170,17 @@ const sameAddresses = (a, b) => a.length === b.length && a.every((x, i) => x ===
  *   C1a  decideSign: a lower nonce or a second digest at one nonce is refused (an identical digest is
  *        approved at once: the same signature goes out again); the nonce must beat the baseline's and be
  *        at most `maxNonceGap` (default 1: exactly the next one) above the newest state held
- *   C2   nothing above a final state (signed by me, or all-signed as the baseline); a final state only
- *        with intent leave/rotate, keep[me] false when leaving, and no kept seat with an empty balance
- *        (settle would revert with BadKeep); a state that is not final carries no keep flag
+ *   C2   nothing above a final state (signed by me, or all-signed as the baseline). A final state is
+ *        otherwise acceptable (F13), whatever the intent, except: keep[me] when I asked to leave (intent
+ *        'leave'), unless the state's nonce is at or below view.leaveAckNonce, the head the server had
+ *        acknowledged when I pressed Leave (that state was already in flight: I sign it and leave() in
+ *        Filling); and any kept seat with less than one chip unit (the contract's BadKeep is balance 0;
+ *        dust alone never keeps a seat). keep[me] = false that I did not ask for is accepted: it is a
+ *        cash-out, never a loss. A state that is not final carries no keep flag
  *   C1e  rake not below the base's and within maxRakeBps of volume
  *   C1c  balances + rake equal the base's balances + rake
- *   C1b  each balance moved by the observed chips * unit; rake and volume by observed rake and pot * unit
+ *   C1b  each balance moved by the observed chips * unit; rake by observed rake * unit; volume by observed
+ *        pot * unit, or, when observed.pot is null (the hand was not watched live), only not downwards
  *
  * "The base" for the money checks is the last state this client SIGNED when that is newer than the
  * all-signed baseline (a hand I signed whose round is still open must not be rewound by the next
@@ -262,13 +279,20 @@ export function clientShouldSign(req, view) {
       );
     }
     if (state.isFinal) {
-      if (v.intent === 'play')
-        return refuse('C2', 'a final state, but you are not leaving or rotating');
-      if (v.intent === 'leave' && state.keep[meIndex]) {
+      // A state at or below the head the server had acknowledged when I pressed Leave was already in
+      // flight: it may keep me, I sign it, and I leave() in Filling. Anything newer must let me go.
+      const inFlightAtLeave = v.leaveAckNonce !== null && state.nonce <= v.leaveAckNonce;
+      if (v.intent === 'leave' && state.keep[meIndex] && !inFlightAtLeave) {
         return refuse('C2', 'you are leaving, but the state keeps your chips at the table');
       }
-      const empty = state.keep.findIndex((kept, i) => kept && state.balances[i] === 0n);
-      if (empty >= 0) return refuse('C2', `player ${empty} is kept with a zero balance (BadKeep)`);
+      // settle reverts with BadKeep for a zero balance; a balance of dust (below one chip) is refused too,
+      // because a seat that cannot post a blind is a seat the table should pay out, not keep
+      const empty = state.keep.findIndex((kept, i) => kept && state.balances[i] < v.unit);
+      if (empty >= 0) {
+        const why =
+          state.balances[empty] === 0n ? 'a zero balance (BadKeep)' : 'less than one chip';
+        return refuse('C2', `player ${empty} is kept with ${why}`);
+      }
     } else if (state.keep.some(Boolean)) {
       // the contract reads keep only in settle, but the digest covers it: an honest server sends all false
       return refuse('C2', 'a state that is not final carries a keep flag');
@@ -285,6 +309,15 @@ export function clientShouldSign(req, view) {
 
     // C1e
     if (state.rake < base.rake) return refuse('C1e', 'rake decreased');
+    // The contract multiplies in checked uint256 arithmetic and reverts with Panic(0x11) on overflow, so a
+    // state with a volume that large could never be used for an exit, a challenge or a settle. With an
+    // unknown pot nothing else bounds the volume, so an honest signature must not make a state like that.
+    if (state.rake * 10_000n > UINT256_MAX || v.maxRakeBps * state.volume > UINT256_MAX) {
+      return refuse(
+        'C1e',
+        'rake or volume is so large that the contract would panic on the cap check',
+      );
+    }
     if (state.rake * 10_000n > v.maxRakeBps * state.volume) {
       return refuse(
         'C1e',
@@ -301,7 +334,7 @@ export function clientShouldSign(req, view) {
     }
 
     // C1b
-    if (v.observed.rake < 0n || v.observed.pot < 0n) {
+    if (v.observed.rake < 0n || (v.observed.pot !== null && v.observed.pot < 0n)) {
       // no hand has a negative pot or rake: a ledger that says so is broken, and volume would go down
       return refuse('VIEW', 'observed.rake and observed.pot must not be negative');
     }
@@ -318,7 +351,14 @@ export function clientShouldSign(req, view) {
         `rake moves by ${state.rake - base.rake}, the hand took ${v.observed.rake * v.unit}`,
       );
     }
-    if (state.volume - base.volume !== v.observed.pot * v.unit) {
+    if (v.observed.pot === null) {
+      // The hand was not watched live, so the pot is unknown. Volume is only self-attested anyway (the
+      // contract uses it for the rake cap and nothing else): it may not go down, and the cumulative cap
+      // (C1e) and the exact rake above still bind. Extra volume buys headroom, never money.
+      if (state.volume < base.volume) {
+        return refuse('C1b', `volume went down from ${base.volume} to ${state.volume}`);
+      }
+    } else if (state.volume - base.volume !== v.observed.pot * v.unit) {
       return refuse(
         'C1b',
         `volume moves by ${state.volume - base.volume}, the pot was ${v.observed.pot * v.unit}`,

@@ -769,6 +769,241 @@ describe('stallAction', () => {
   });
 });
 
+// Every combination of what the chain says and what the store holds, judged two ways: against a plain
+// restatement of the table in docs/signing-layer.md section 4 (so a flipped comparison anywhere fails), and
+// against the rules that must hold whatever the table says (so a wrong oracle cannot excuse a wrong answer).
+describe('nextChainAction: the whole cross product', () => {
+  const held = (name, bundle, state) => ({
+    name,
+    bundle,
+    nonce: Number(state.nonce),
+    final: state.isFinal,
+    digest: digest(state),
+  });
+  const B = {
+    h1: held('h1', b.h1, h1),
+    h2: held('h2', b.h2, h2),
+    f3: held('f3', b.f3, f3),
+    h4: held('h4', b.h4, h4),
+    h5: held('h5', b.h5, h5),
+    f6: held('f6', b.f6, f6),
+  };
+  // epoch 1 starts at nonce 0 and has no previous final; epoch 2 starts at 3 and may or may not still hold f3
+  const stores = [
+    ...[null, 'h1', 'h2', 'f3'].map((cur) => ({
+      base: 0,
+      cur,
+      prev: null,
+      deposit: depositDigest1,
+    })),
+    ...[null, 'h4', 'h5', 'f6'].flatMap((cur) =>
+      [null, 'f3'].map((prev) => ({ base: 3, cur, prev, deposit: depositDigest2 })),
+    ),
+  ];
+  const digests = [
+    ...Object.values(B).map((x) => x.digest),
+    depositDigest1,
+    depositDigest2,
+    OTHER_DIGEST,
+  ];
+  const times = [DEADLINE - MARGIN - 1, DEADLINE - MARGIN, DEADLINE - 1, DEADLINE, DEADLINE + 1];
+
+  // the table, restated as plainly as possible
+  function oracle({ status, nonce, exitDigest, now, margin, cur, prev, base, depositDigest }) {
+    if (status !== 'Active' && status !== 'Exiting') return null;
+    const finalAbove = [cur, prev].some((x) => x?.final && x.nonce > nonce);
+    if (finalAbove) return settle;
+    const known = cur ? cur.nonce : base;
+    if (status === 'Active') {
+      if (cur) {
+        if (cur.nonce > nonce) return null;
+        return cur.final && cur.nonce === nonce ? null : alarm(ALARMS.chainNonceAboveBundle);
+      }
+      return nonce > base ? alarm(ALARMS.chainNonceAboveBundle) : null;
+    }
+    if (nonce > known) return alarm(ALARMS.chainNonceAboveBundle);
+    if (nonce < known) {
+      if (!cur) return alarm(ALARMS.chainBehindStore);
+      return now + margin < DEADLINE ? challenge : alarm(ALARMS.challengeWindowMissed);
+    }
+    const expected = cur ? cur.digest : depositDigest;
+    if (expected !== exitDigest) return alarm(ALARMS.exitDigestMismatch);
+    return now > DEADLINE ? finalizeExit : null;
+  }
+
+  function* cases() {
+    for (const st of stores) {
+      const cur = st.cur ? B[st.cur] : null;
+      const prev = st.prev ? B[st.prev] : null;
+      const view = store({
+        base: st.base,
+        bundle: cur?.bundle ?? null,
+        finalBundle: prev?.bundle ?? null,
+      });
+      for (let nonce = 0; nonce <= 7; nonce++) {
+        yield {
+          status: 'Active',
+          chainRow: active(nonce),
+          view,
+          nonce,
+          cur,
+          prev,
+          base: st.base,
+          now: NOW,
+          margin: MARGIN,
+          depositDigest: undefined,
+        };
+        for (const exitDigest of digests) {
+          for (const now of times) {
+            for (const margin of [0, MARGIN]) {
+              for (const depositDigest of [undefined, st.deposit]) {
+                yield {
+                  status: 'Exiting',
+                  chainRow: exiting(nonce, exitDigest),
+                  view,
+                  nonce,
+                  exitDigest,
+                  cur,
+                  prev,
+                  base: st.base,
+                  now,
+                  margin,
+                  depositDigest,
+                };
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const run = (c) =>
+    nextChainAction({
+      chainRow: c.chainRow,
+      store: c.view,
+      chainTime: c.now,
+      challengeMarginSec: c.margin,
+      depositDigest: c.depositDigest,
+    });
+
+  test('agrees with the table in every combination, and every outcome is reached', () => {
+    const wrong = [];
+    const seen = new Map();
+    let total = 0;
+    for (const c of cases()) {
+      total++;
+      const got = run(c);
+      const want = oracle(c);
+      const label = got === null ? 'null' : (got.alarm ?? got.kind);
+      seen.set(label, (seen.get(label) ?? 0) + 1);
+      if (JSON.stringify(got) !== JSON.stringify(want)) {
+        wrong.push(
+          `${c.status} chain ${c.nonce} base ${c.base} cur ${c.cur?.name} prev ${c.prev?.name} now ${c.now} margin ${c.margin}: ${JSON.stringify(got)} want ${JSON.stringify(want)}`,
+        );
+      }
+    }
+    expect(wrong.slice(0, 5)).toEqual([]);
+    expect(total).toBeGreaterThan(10_000);
+    for (const outcome of [
+      'null',
+      'settle',
+      'challenge',
+      'finalizeExit',
+      ...Object.values(ALARMS),
+    ]) {
+      expect(seen.get(outcome) ?? 0).toBeGreaterThan(0);
+    }
+  });
+
+  test('the rules that hold whatever the table says', () => {
+    const broken = [];
+    const finalAbove = (c) => [c.cur, c.prev].some((x) => x?.final && x.nonce > c.nonce);
+    for (const c of cases()) {
+      const got = run(c);
+      const act = got?.kind;
+      const fail = (rule) =>
+        broken.push(
+          `${rule}: ${JSON.stringify(got)} for ${c.status} ${c.nonce} cur ${c.cur?.name} prev ${c.prev?.name} now ${c.now} margin ${c.margin}`,
+        );
+
+      // a table that is not running never gets an action
+      if (c.status !== 'Active' && c.status !== 'Exiting' && got !== null) fail('idle table');
+      // a final state above the chain is always settled, in Active and in Exiting, before the deadline and after
+      if (finalAbove(c) !== (act === 'settle'))
+        fail('settle exactly when a final is above the chain');
+      // a challenge: Exiting, a NOT final bundle above the chain, and time to spare by the margin
+      if (act === 'challenge') {
+        if (c.status !== 'Exiting') fail('challenge outside Exiting');
+        if (!c.cur || c.cur.final || c.cur.nonce <= c.nonce)
+          fail('challenge without a newer non-final bundle');
+        if (!(c.now + c.margin < DEADLINE)) fail('challenge without time');
+        if (finalAbove(c)) fail('challenge while a final is waiting');
+      }
+      // finalizeExit: Exiting, the digest we hold, after the deadline, and nothing newer to say
+      if (act === 'finalizeExit') {
+        if (c.status !== 'Exiting') fail('finalizeExit outside Exiting');
+        if (!(c.now > DEADLINE)) fail('finalizeExit inside the window');
+        const expected = c.cur ? c.cur.digest : c.depositDigest;
+        if (expected !== c.exitDigest) fail('finalizeExit for a digest we do not hold');
+        if (c.nonce !== (c.cur ? c.cur.nonce : c.base))
+          fail('finalizeExit at a nonce we do not hold');
+      }
+      // a chain nonce above everything we hold is never acted on
+      const known = c.cur ? c.cur.nonce : c.base;
+      if (
+        c.status === 'Exiting' &&
+        c.nonce > known &&
+        got?.alarm !== ALARMS.chainNonceAboveBundle
+      ) {
+        fail('chain above the store must alarm');
+      }
+      // an exit we cannot account for is never finalised, and never sits quietly
+      if (c.status === 'Exiting' && c.nonce === known) {
+        const expected = c.cur ? c.cur.digest : c.depositDigest;
+        if (expected !== c.exitDigest && got?.alarm !== ALARMS.exitDigestMismatch)
+          fail('digest mismatch must alarm');
+      }
+    }
+    expect(broken.slice(0, 5)).toEqual([]);
+  });
+
+  test('a table that is Filling, Closed, None or unknown gets nothing, whatever the store holds', () => {
+    for (const st of stores) {
+      const view = store({
+        base: st.base,
+        bundle: st.cur ? B[st.cur].bundle : null,
+        finalBundle: st.prev ? B[st.prev].bundle : null,
+      });
+      for (const chainRow of [
+        null,
+        undefined,
+        { status: 'None' },
+        ...['Filling', 'Closed'].flatMap((status) =>
+          [0, 3, 6, 9].map((n) => ({
+            status,
+            nonce: BigInt(n),
+            exitDigest: OTHER_DIGEST,
+            exitDeadline: 0,
+          })),
+        ),
+      ]) {
+        for (const now of times) {
+          expect(
+            nextChainAction({
+              chainRow,
+              store: view,
+              chainTime: now,
+              challengeMarginSec: MARGIN,
+              depositDigest: st.deposit,
+            }),
+          ).toBeNull();
+        }
+      }
+    }
+  });
+});
+
 // The reconciler against the FakeChain: what it decides must be something the chain accepts, and following
 // it must end where the design says (the funds paid out exactly as the newest state says).
 describe('the reconciler driving a FakeChain', () => {

@@ -7,8 +7,11 @@
 //
 // The second form makes the child kill ITSELF with SIGKILL in the middle of a transaction, which a timer in
 // the parent can almost never hit (the commit's fsync is slow, but a kill during it is harmless): during the
-// n-th reserve of this run, after its 1st or 2nd write and before the commit (phase reserve:1, reserve:2), or
-// during the n-th attach of the arbiter signature (attach:1).
+// n-th reserve of this run, after its 1st or 2nd write and before the commit (phase reserve:1, reserve:2),
+// during the n-th attach of the arbiter signature (attach:1), or during the transaction the coordinator runs
+// when the last signature of the n-th round arrives (settle:k, after its k-th write). That round is a final
+// state, and the transaction is saveBundle + phase 'settling' + the settle job, all or nothing. The phase
+// settle:done lets that transaction commit and then kills the child, so the test can see the other side.
 //
 // It continues from the store's high-water mark, so several runs on one file make one growing history.
 import { writeSync } from 'node:fs';
@@ -40,12 +43,32 @@ say('ready');
 
 let nonce = store.loadTable(world.tableKey).nonceHw + 1n;
 for (let run = 1; ; run++) {
-  const state = world.stateAt(nonce);
+  const settling = phase?.startsWith('settle:') && run === dieAt;
+  const state = world.stateAt(
+    nonce,
+    settling ? { isFinal: true, keep: world.players.map(() => true) } : {},
+  );
   const digest = world.digestOf(state);
   if (phase?.startsWith('reserve:') && run === dieAt) store.failAfterWrites(dieAfterWrite, suicide);
   store.reserve(world.tableKey, state, digest);
   say(`${nonce} ${digest}`);
   if (phase === 'attach:1' && run === dieAt) store.failAfterWrites(1, suicide);
   store.attachArbiterSig(world.tableKey, nonce, world.arbiterSigFor(state));
+  if (settling) {
+    // the last player signature arrives: complete the round and queue the settle in one transaction
+    if (phase !== 'settle:done') store.failAfterWrites(dieAfterWrite, suicide);
+    store.transaction(() => {
+      store.saveBundle(world.tableKey, world.bundleFor(state), world.verifyCtx());
+      store.saveTable(world.record({ phase: 'settling' }));
+      store.enqueueJob({
+        key: `chain-action:${world.tableKey}`,
+        kind: 'settle',
+        tableKey: world.tableKey,
+        priority: 5,
+      });
+    });
+    say('committed'); // reached only if the kill did not land inside the transaction
+    suicide();
+  }
   nonce += 1n;
 }
