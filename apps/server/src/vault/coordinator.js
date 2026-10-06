@@ -715,6 +715,9 @@ export class VaultCoordinator {
   #maybeStart(row) {
     if (this.#halt || this.#rec.drain) return false;
     const now = this.#clock.now();
+    // the hold runs from when this process first saw the table filling: after a restart (or a refused start)
+    // nothing else sets it, and an unset hold must not mean "hold for ever"
+    this.#fillingSince ??= now;
     if (now < (this.#notBefore.get(JOB_KINDS.start) ?? -Infinity)) return false;
     if (this.#startBlocker(row, now) !== null) return false;
     const roster = [...this.#rec.depositors].sort();
@@ -732,7 +735,7 @@ export class VaultCoordinator {
     );
     if (depositors.length < 2) return 'too-few';
     if (row.seated !== depositors.length) return 'depositor-unknown';
-    if (now < (this.#fillingSince ?? now) + this.#policy.startHoldMs) return 'hold';
+    if (now < this.#fillingSince + this.#policy.startHoldMs) return 'hold';
     const arbiter = normalizeAddress(this.#signer.address);
     const keys = new Set();
     for (const address of depositors) {

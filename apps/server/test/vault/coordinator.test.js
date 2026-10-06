@@ -211,6 +211,19 @@ describe('the honest lifecycle', () => {
     expect(c.phase).toBe('filling');
     noRefusals(w);
   });
+  test('a restart between epochs: the hold runs again and the table starts (it used to wait for ever)', () => {
+    const w = makeVaultWorld();
+    const c = w.activate({ chips: [100, 100, 100] });
+    const [alice, bob] = w.players;
+    w.playHand({ winner: alice, loser: bob, amount: 100 }); // bob busts: final, settle, filling
+    w.settle();
+    expect(c.phase).toBe('filling');
+    w.restart();
+    for (const p of w.seated) w.claim(p);
+    w.startEpoch();
+    expect(w.coordinator.phase).toBe('active');
+    expect(w.coordinator.publicView().epoch).toBe(2);
+  });
 });
 
 describe('the deal gate (S1)', () => {
