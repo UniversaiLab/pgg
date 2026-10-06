@@ -385,6 +385,87 @@ silent default.
   until the chain really settles, and accepted after (`test/chain/chainview.test.js` runs it across a real
   settle and start).
 
+### `signer.js`: the client's durable signer
+
+`createSigner({ storage, chainView?, newKey?, now? })` is the one place a browser (or a test bot) keeps its
+session key and decides what that key signs. `storage` is synchronous and `localStorage`-shaped
+(`getItem`, `setItem`, `removeItem`); every call is wrapped, and a failure is reported, never swallowed: a read
+that throws is not "no record" (that would mint a second key), and a write that throws or does not read back the
+same means no signature leaves. `chainView` is `{ table(tableKey), seat(tableKey, address) }` as
+`createRpcChainView` returns it, built from an RPC URL and vault address **pinned in the app build**, never from a
+server message. `newKey` and `now` are injected so tests are repeatable.
+
+| Method | Does |
+| --- | --- |
+| `ensureSessionKey(tableKey, { wallet?, domain?, unit?, chainSeat? })` | Creates the key if there is none and **writes it (and reads it back) before returning the address**, so it exists before any deposit can. Never replaces a key. A record whose key is unreadable, or no record while `chainSeat` (a fresh chain read) shows this wallet seated, is `lost-key`: reported, never regenerated. -> `{ ok, address, created }` or `{ ok: false, kind, detail }` |
+| `handleEpoch(epochMsg, ctx)` (async) | Pins an epoch only after `verifyEpochAgainstChain` agrees on a fresh chain read (F1). Refuses a genesis below the nonce high-water mark, another session key for my seat, and anything while a signed final is latched until `chainShowsSettled` (the same read clears the latch). Without a chain view: `UNPINNED`, unless `ctx.allowUnpinned`, which takes only a table's first epoch and records a persistent `unpinned` warning. `ctx = { wallet, domain, unit, maxRakeBps, myDeposit?, allowFilling?, allowUnpinned?, tableKey? }`. Never throws. |
+| `handleSignReq(signreqMsg, { ledger, tableKey? })` | Synchronous. `{ action: 'send', nonce, digest, sig }` (the record is on disk: send exactly these), `{ action: 'refuse', rule, detail }` or `{ action: 'wait', reason, detail }` (no epoch pinned yet, or the ledger cannot judge yet: ask again on the next table or epoch message). |
+| `acceptBundle(bundleMsg)` | Stores the newest all-signed state only when every signature verifies against the **pinned** keys, arbiter, roster, table and domain, and the nonce is higher. Equal nonce and another digest is a blocking `bundle-conflict`. A final bundle latches the table. -> `{ stored: true, nonce, final }` or `{ stored: false, reason, detail }` |
+| `noteLeave(tableKey, headNonce)` | Records `leaveAckNonce` (bounded by my own records: at most one state past the newest I hold). The first press wins. |
+| `settledObserved(tableKey, chainTable)` | Pass a FRESH `tables()` read. Opens the final latch only when `chainShowsSettled`; what I carry into the next epoch is the balance the final kept for me. |
+| `signClaim(tableKey, { playerId, domain?, wallet? })` | The session-key proof of an on-chain seat (identity, never funds). |
+| `restore(tableKey)` | The record without the private key, or why it cannot be read. |
+| `failure(tableKey)` | The worst failure on record (`{ kind, rule, detail, nonce, blocking, kinds }`) or `null`. |
+| `forget(tableKey, { chainShowsDone, exitWindowPassed })` | Deletes the record only when the caller's own chain read shows the table done AND the exit window has passed. No server message deletes anything. |
+
+The rules it enforces, each tested in `test/signer.test.js`: the `{ nonce, digest, sig, state }` record is
+written **before** a signature is returned; the same nonce and digest gets the identical signature (signing is
+deterministic); another digest at a signed nonce is refused and is a persistent `equivocation`; a lower nonce is
+refused; nothing higher than a signed final is signed until `settledObserved`; the digest signed is the one
+`clientShouldSign` computed, never the request's `digest` field; a torn, edited or contradictory record fails
+closed.
+
+**The record**, one JSON blob under `RECORD_PREFIX + tableKey` (`'pgg.vault.v1.0x…'`), written with one
+`setItem` so a crash leaves the old record or the new one. Amounts and nonces are decimal strings.
+
+```js
+{
+  v: 1, tableKey, sessionKey,      // the private key: never replaced, never sent anywhere
+  address,                         // the session key's address (checked against sessionKey on every read)
+  wallet, domain, unit,            // pinned when the key was made or at the first epoch
+  roster, deposit,                 // the pinned roster, my balance at its genesis
+  last,                            // { nonce, digest, sig, isFinal, state } | null: the newest state this key signed
+  bundle,                          // the newest all-signed state (wire form) | null
+  pinned,                          // { epoch, genesis, sessionKeys, arbiter, maxRakeBps, unpinned } | null
+  epochClosed,                     // the final latch
+  leaveAckNonce,                   // null until I press Leave
+  failures,                        // [{ kind, rule, detail, nonce }], at most 16, blocking ones are never dropped
+  createdAt,
+}
+```
+
+**Failure kinds** (`FAILURE_KINDS`). Blocking ones stop all signing at that table for good (the stall exit
+still pays everyone from the last all-signed state); the others are shown and kept but do not stall an honest
+table. The app shows them in a persistent banner, never a toast.
+
+| Kind | Blocking | Means |
+| --- | --- | --- |
+| `lost-key` | yes | a record or an on-chain seat exists but the key is missing or unreadable; a new one is never made |
+| `corrupt` | yes | the record cannot be read or contradicts itself |
+| `equivocation` | yes | the server asked for a different state at a nonce this key already signed |
+| `bundle-conflict` | yes | two fully signed states at one nonce |
+| `storage` | no | a read or write failed; nothing was signed that is not on disk |
+| `refused` | no | a proposal broke a rule and was not signed |
+| `unpinned` | no | the epoch was taken without a chain view (dev only) |
+
+### `ledger.js`: what the client saw (F8)
+
+`createLedger({ unit, tableId? })` builds what `clientShouldSign` compares a proposal with from the **current
+public table state**, not from replayed hand events, so a client that reconnects or backgrounds the page still
+has a view.
+
+- `observeTable(tblMsg)`: the seats (address, chips, bet) and whether a hand is running; hand-end events in the
+  message are recorded too. A malformed message makes the ledger forget, because stale stacks are worse than none.
+- `observeEvent({ type: 'hand-end', result }, epoch?)`: a live hand result keyed by `(epoch, handNo)`; the first
+  account of a hand wins, a different second one is a conflict that never clears.
+- `observedStatus({ base, roster, handNo })` -> `{ ok: true, observed: { deltas, rake, pot } }` or
+  `{ ok: false, reason, detail, permanent }`. `delta_i = chips shown_i - floor(base.balances_i / unit)`, `rake =
+  -sum(deltas)`, `pot` is the live result of `handNo` when this client watched it (else `null`). Reasons
+  (`LEDGER_BLOCKERS`): `no-table`, `mid-hand` and `unknown-address` are waits (the next table message fixes
+  them); `bad-seat`, `duplicate-address`, `stacks-exceed-base` and `conflict` are permanent and the signer
+  refuses (`LEDGER`).
+- `observedFor(args)`: the same, `null` instead of a reason. `conflicts()` lists every disagreement seen.
+
 ### `ids.js`
 
 - `tableKeyFor({ chainId, vault, serverId, generation })` = `keccak256(utf8("pgg:" + chainId + ":" + vault + ":" + serverId + ":" + generation))`,
@@ -572,6 +653,156 @@ export function main() {
 if (import.meta.main) console.log(main());
 ```
 
+## Signer example
+
+The client side in one page: a session key, an epoch checked against a chain view, a hand signed (twice, with
+the identical signature), the bundle kept, then two lies refused. `test/signer.test.js` runs this code.
+
+```js
+// Signer example: one player's browser, from a new session key to a refused equivocation.
+import {
+  buildNextState,
+  createLedger,
+  createSigner,
+  epochBaseline,
+  hashState,
+  privateKeyToAddress,
+  RECORD_PREFIX,
+  rosterHash,
+  STATUS,
+  signDigest,
+  tableKeyFor,
+  toWire,
+} from '@pgg/vault';
+
+export async function main() {
+  const domain = { chainId: 31337, verifyingContract: '0x00000000000000000000000000000000000dead1' };
+  const unit = 10_000n; // token base units per chip
+  const tableKey = tableKeyFor({
+    chainId: domain.chainId,
+    vault: domain.verifyingContract,
+    serverId: 'demo',
+    generation: 1,
+  });
+  const key = (byte) => `0x${byte.repeat(32)}`;
+  const arbiterKey = key('a1');
+  const me = { wallet: privateKeyToAddress(key('01')), sessionKey: key('11') };
+  const bob = { wallet: privateKeyToAddress(key('02')), sessionKey: key('22') };
+  const players = [me, bob].sort((a, b) => (a.wallet < b.wallet ? -1 : 1)); // ascending, as the contract wants
+  const deposit = 1000n * unit;
+
+  // The chain view stands in for createRpcChainView over an RPC URL pinned in the app build. Here it answers
+  // from a plain row: both players deposited 1000 chips and the arbiter started the table.
+  const genesis = epochBaseline({
+    tableId: tableKey,
+    players: players.map((p) => p.wallet),
+    deposits: players.map(() => deposit),
+    nonce: 0n,
+    rake: 0n,
+    volume: 0n,
+  });
+  const row = {
+    status: STATUS.Active,
+    maxPlayers: 6,
+    seated: 2,
+    arbiter: privateKeyToAddress(arbiterKey),
+    nonce: 0n,
+    exitDeadline: 0n,
+    minDeposit: 1n,
+    maxDeposit: 10n ** 30n,
+    escrow: 2n * deposit,
+    rakePaid: 0n,
+    rosterHash: rosterHash(genesis.players),
+    exitDigest: `0x${'00'.repeat(32)}`,
+  };
+  const chainView = {
+    table: async () => ({ ok: true, table: row }),
+    seat: async (_tableKey, address) => {
+      const p = players.find((x) => x.wallet === address);
+      return { ok: true, seat: p ? { deposit, sessionKey: privateKeyToAddress(p.sessionKey) } : null };
+    },
+  };
+
+  // A synchronous storage like localStorage. The signer keeps one JSON record per table in it.
+  const map = new Map();
+  const storage = {
+    getItem: (k) => map.get(k) ?? null,
+    setItem: (k, v) => map.set(k, String(v)),
+    removeItem: (k) => map.delete(k),
+  };
+  // newKey is injected only to make the example repeatable; the default draws a fresh random key
+  const signer = createSigner({ storage, chainView, newKey: () => me.sessionKey });
+
+  // 1. The session key is written BEFORE its address is returned: only then may the wallet deposit with it.
+  const made = signer.ensureSessionKey(tableKey, { wallet: me.wallet, domain, unit });
+
+  // 2. The epoch message is checked against the chain before anything is signed (F1).
+  const epoch = {
+    epoch: 1,
+    domain,
+    state: toWire(genesis),
+    sessionKeys: players.map((p) => privateKeyToAddress(p.sessionKey)),
+    arbiter: row.arbiter,
+  };
+  const pinned = await signer.handleEpoch(epoch, { wallet: me.wallet, domain, unit, maxRakeBps: 500 });
+
+  // 3. Hand 1: I win 30 chips from bob and the house takes 1. The ledger keeps what this browser SAW.
+  const ledger = createLedger({ unit });
+  const chips = (p) => (p === me ? 1029 : 970);
+  const seats = [me, bob].map((p, seat) => ({ seat, chips: chips(p), bet: 0, address: p.wallet }));
+  const result = { handNo: 1, pot: 60, rake: 1, stacks: seats.map((s) => s.chips), busted: [] };
+  ledger.observeTable({
+    state: { handNo: 1, inHand: false, seats, vault: { epoch: 1 } },
+    events: [{ type: 'hand-end', result }],
+  });
+  const state = buildNextState({
+    prev: genesis,
+    balances: players.map((p) => BigInt(chips(p)) * unit),
+    rakeDelta: 1n * unit,
+    volumeDelta: 60n * unit,
+  });
+  const digest = hashState(state, domain);
+  const req = { epoch: 1, handNo: 1, state: toWire(state), digest };
+  const signed = signer.handleSignReq(req, { ledger }); // on disk before it is returned
+  const again = signer.handleSignReq(req, { ledger }); // a re-sent request: the identical signature
+
+  // 4. Everyone signed: the bundle is kept only if every signature verifies against the pinned epoch.
+  const stored = signer.acceptBundle({
+    domain,
+    state: toWire(state),
+    arbiterSig: signDigest(arbiterKey, digest),
+    playerSigs: players.map((p) => (p === me ? signed.sig : signDigest(p.sessionKey, digest))),
+  });
+
+  // 5. A server that moves 100 chips from me to bob between hands is refused (C1b: nothing at the table
+  //    moved them), and so is a second state at the nonce I already signed (C1a): that is equivocation,
+  //    and it stops all signing at this table for good.
+  const moved = players.map((p) => BigInt(chips(p) + (p === me ? -100 : 100)) * unit);
+  const lie = signer.handleSignReq(
+    { epoch: 1, handNo: null, state: toWire(buildNextState({ prev: state, balances: moved })) },
+    { ledger },
+  );
+  const twin = signer.handleSignReq(
+    { epoch: 1, handNo: 1, state: toWire({ ...state, volume: state.volume + 1n }) },
+    { ledger },
+  );
+  const failure = signer.failure(tableKey); // persistent: the app shows it as a banner, never a toast
+
+  const record = JSON.parse(storage.getItem(RECORD_PREFIX + tableKey));
+  return {
+    key: made,
+    pinned,
+    signed,
+    again,
+    stored,
+    lie,
+    twin,
+    failure,
+    recorded: record.last.sig === signed.sig && record.sessionKey === me.sessionKey,
+  };
+}
+```
+
 ## Tests
 
 ```sh
@@ -591,6 +822,12 @@ PATH=/opt/foundry:$PATH PGG_REQUIRE_CHAIN_TESTS=1 bun test packages/vault
 - `chainview.test.js` and `chain/chainview.test.js`: the hand-written ABI codec against viem on random inputs, the
   JSON-RPC view against every kind of hostile or broken node (a fake `fetch` and a real HTTP server), every refusal
   rule of `verifyEpochAgainstChain`, the lying-server scenario, and the whole thing against a real anvil.
+- `signer.test.js`: write-before-return proved with storage fakes that record call order, throw, or drop
+  writes; equivocation; the final latch; bundles; corrupt and torn records; the signer over a real
+  `createRpcChainView`. `ledger.test.js`: reconnects, aborted hands, conflicting accounts, unknown addresses.
+  `hostile.test.js`: a MaliciousServer drives the real signer, ledger, rules and chain view through every attack
+  in `docs/signing-layer.md` section 8 (no signature leaves), and an honest run with a leave, a final, the settle
+  and a second epoch (nothing is refused). `signer-world.js` is their shared world.
 - `rules.test.js`, `bundle.test.js`, `state.test.js`, `units.test.js`, `ids.test.js`, `build.test.js`, `abi.test.js`,
   `rake-ceiling.test.js`.
 - `review-*.test.js`: the adversarial review of every module. A title starting with `REVIEW BUG` or `REVIEW GAP`

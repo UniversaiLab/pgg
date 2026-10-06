@@ -45,6 +45,7 @@ export {
   STATE_TYPEHASH,
 } from './eip712.js';
 export { claimDigest, recoverClaim, signClaim, tableKeyFor, verifyClaim } from './ids.js';
+export { createLedger, LEDGER_BLOCKERS } from './ledger.js';
 export {
   canDeal,
   clientShouldSign,
@@ -64,6 +65,7 @@ export {
   toHex,
   tryRecoverSigner,
 } from './sign.js';
+export { createSigner, FAILURE_KINDS, RECORD_PREFIX } from './signer.js';
 export {
   compareAddress,
   decodeState,

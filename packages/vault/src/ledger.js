@@ -4,23 +4,30 @@
 //
 //   delta_i = chips shown_i - floor(base.balances_i / unit)        what each roster seat won or lost since the base
 //   rake    = - sum(delta_i)                                       chips that left the table
-//   pot     = the live hand-end result for this hand, else null    exact only when the hand was watched live
+//   pot     = the live hand-end result of the hand the proposal    exact only when that hand was watched live
+//             names, else null
 //
-// The base is a State (the last state this client signed, or the epoch's baseline): the caller picks it. Dust
+// The base is a State (the last state this client signed, or the epoch's baseline): the signer picks it. Dust
 // never moves in a hand, so flooring the base balance to whole chips makes it cancel out.
 //
+// The pot is matched to the hand the proposal is for (signreq.handNo), never to "the last hand shown": a
+// standalone final (a rotation between hands) follows no hand, and comparing its volume with the previous
+// hand's pot would refuse an honest rotation. The hand number only picks which pot the volume is compared with,
+// so a lie about it costs nothing: volume is self-attested and buys rake headroom, never money.
+//
 // The ledger never throws on what the server sends (a malformed table message just makes it forget what it
-// knew), and it says "I do not know" (null) rather than guess: an unknown address, a hand still in progress, or
-// two accounts of the same hand that disagree.
+// knew), and it says "I do not know" rather than guess: an unknown address, a hand still in progress, or two
+// accounts of the same hand that disagree.
 import { normalizeAddress } from './state.js';
 
 const MAX_RESULTS = 32; // enough to span every hand a sign round can straddle; older ones are dropped
 const isCount = (value) => Number.isSafeInteger(value) && value >= 0;
 
 /**
- * Why observedFor answered null, and whether waiting can fix it. A "wait" reason (no table state yet, a hand in
- * progress, an address not seen yet) goes away by itself when the next table message arrives; a "permanent" one
- * (the server's own accounts disagree) never does, so the signer refuses instead of waiting for it.
+ * Why observedStatus answered no, and whether waiting can fix it. A "wait" reason (no table state yet, a hand
+ * in progress, an address not shown yet) goes away by itself when the next table message arrives; a
+ * "permanent" one (the server's own accounts disagree, or show chips that cannot exist) does not, so the
+ * signer refuses instead of waiting for it.
  */
 export const LEDGER_BLOCKERS = Object.freeze({
   'no-table': 'wait',
@@ -34,14 +41,15 @@ export const LEDGER_BLOCKERS = Object.freeze({
 
 const sameList = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-// A hand-end result as the engine emits it: { handNo, pot, rake, stacks (per seat, chips) }. Anything else is
-// not trusted as a live account of the hand.
+// A hand-end result as the engine emits it: { handNo, pot, rake, stacks (chips per seat), busted (seats) }.
+// Anything else is not trusted as a live account of the hand.
 function readResult(raw) {
   if (raw === null || typeof raw !== 'object') return null;
-  const { handNo, pot, rake, stacks } = raw;
-  if (!Number.isInteger(handNo) || handNo < 0 || !isCount(pot) || !isCount(rake)) return null;
+  const { handNo, pot, rake, stacks, busted = [] } = raw;
+  if (!isCount(handNo) || !isCount(pot) || !isCount(rake)) return null;
   if (!Array.isArray(stacks) || !stacks.every(isCount)) return null;
-  return { handNo, pot, rake, stacks: [...stacks] };
+  if (!Array.isArray(busted) || !busted.every(isCount)) return null;
+  return { handNo, pot, rake, stacks: [...stacks], busted: [...busted] };
 }
 
 // The public table state reduced to what the checks read. Throws on a shape that is not a table state.
@@ -67,19 +75,13 @@ function readTable(state) {
     }
     if (address === null) return;
     if (byAddress.has(address)) duplicates.add(address);
-    else {
-      byAddress.set(address, {
-        index,
-        chips: isCount(seat.chips) ? seat.chips : null,
-        status: seat.status,
-      });
-    }
+    else byAddress.set(address, { index, chips: isCount(seat.chips) ? seat.chips : null });
   });
   return {
     // only an explicit false counts: a missing or odd inHand is "a hand may be running"
     quiet: state.inHand === false && !betting,
-    handNo: Number.isInteger(state.handNo) ? state.handNo : null,
-    epoch: Number.isInteger(state.vault?.epoch) ? state.vault.epoch : null,
+    handNo: isCount(state.handNo) ? state.handNo : null,
+    epoch: isCount(state.vault?.epoch) ? state.vault.epoch : null,
     byAddress,
     duplicates,
   };
@@ -93,7 +95,7 @@ const asNumber = (value) =>
 /**
  * @param {{ unit: bigint, tableId?: string }} options
  *   unit     token base units per chip (the one pinned when the player deposited)
- *   tableId  when given, table messages for any other table are ignored
+ *   tableId  when given, table messages for any other (game) table are ignored
  */
 export function createLedger({ unit, tableId } = {}) {
   if (typeof unit !== 'bigint' || unit <= 0n) throw new TypeError('unit must be a bigint above 0');
@@ -123,7 +125,8 @@ export function createLedger({ unit, tableId } = {}) {
     const same =
       first.pot === result.pot &&
       first.rake === result.rake &&
-      sameList(first.stacks, result.stacks);
+      sameList(first.stacks, result.stacks) &&
+      sameList(first.busted, result.busted);
     if (same) return { ok: true, stored: false };
     // first seen wins: the second account is kept out, and the disagreement is on record
     flag('hand-end', epoch, result.handNo, `two different results for hand ${result.handNo}`);
@@ -137,9 +140,42 @@ export function createLedger({ unit, tableId } = {}) {
     permanent: LEDGER_BLOCKERS[reason] === 'permanent',
   });
 
-  return {
+  // The live result of `handNo`, checked against the stacks it left behind. null when the hand was not
+  // watched live (or the table shows another hand); a blocked() answer when the two accounts disagree.
+  function liveResult(handNo, seats, rake) {
+    if (!isCount(handNo) || table.handNo !== handNo) return null;
+    const key = keyOf(table.epoch, handNo);
+    if (conflicts.has(`hand-end:${key}`)) {
+      return blocked('conflict', `the server gave two different results for hand ${handNo}`);
+    }
+    const result = results.get(key);
+    if (!result) return null;
+    // A seat the engine dealt in shows exactly the stack the result gave it, a busted one shows 0. A seat
+    // with 0 in the result that did not bust was not in the hand (waiting, sitting out), so it is skipped.
+    for (const seat of seats) {
+      const stack = result.stacks[seat.index];
+      const played = (stack !== undefined && stack > 0) || result.busted.includes(seat.index);
+      if (played && stack !== seat.chips) {
+        flag('stacks', table.epoch, handNo, `seat ${seat.index} differs from the result`);
+        return blocked(
+          'conflict',
+          `the hand-end result and the stacks disagree on seat ${seat.index}`,
+        );
+      }
+    }
+    if (BigInt(result.rake) !== rake) {
+      flag('rake', table.epoch, handNo, `the result took ${result.rake}, the stacks lost ${rake}`);
+      return blocked(
+        'conflict',
+        `the hand-end result took ${result.rake} chips of rake, the stacks lost ${rake}`,
+      );
+    }
+    return { ok: true, pot: result.pot };
+  }
+
+  const ledger = {
     /**
-     * Take in one `tbl` message: the public seats (address, chips, status) and whether a hand is running. Any
+     * Take in one `tbl` message: the public seats (address, chips) and whether a hand is running. Any
      * hand-end events it carries are recorded too. A message that is not a table state makes the ledger forget
      * the last one, because stale stacks are worse than none. Returns { ok: true } or { ok: false, reason }.
      */
@@ -163,9 +199,9 @@ export function createLedger({ unit, tableId } = {}) {
 
     /**
      * Record a hand-end result the client watched live: `{ type: 'hand-end', result: { handNo, pot, rake,
-     * stacks } }`, keyed by (epoch, handNo); `epoch` defaults to the one the newest table message carried. The
-     * first result for a hand wins; an identical repeat is ignored; a different one is a conflict.
-     * Returns { ok: true, stored, conflict? } or { ok: false, reason: 'malformed' }.
+     * stacks, busted } }`, keyed by (epoch, handNo); `epoch` defaults to the one the newest table message
+     * carried. The first result for a hand wins; an identical repeat is ignored; a different one is a
+     * conflict. Returns { ok: true, stored, conflict? } or { ok: false, reason: 'malformed' }.
      */
     observeEvent(event, epoch = table?.epoch ?? null) {
       if (event === null || typeof event !== 'object' || event.type !== 'hand-end') {
@@ -178,20 +214,24 @@ export function createLedger({ unit, tableId } = {}) {
     conflicts: () => [...conflicts.values()],
 
     /**
-     * observedFor with the reason. { ok: true, observed } or { ok: false, reason, detail, permanent }, reason one
-     * of LEDGER_BLOCKERS. `base` is the State the proposal is judged against, `roster` the seats' addresses in
-     * state order (they must be the base's players).
+     * observedFor with the reason: { ok: true, observed } or { ok: false, reason, detail, permanent }, reason
+     * one of LEDGER_BLOCKERS. `base` is the State the proposal is judged against, `roster` the seats'
+     * addresses in state order (they must be the base's players), `handNo` the hand the proposal says it is
+     * for (signreq.handNo; null or absent for a state that follows no hand). A bad `base` or `roster` is a
+     * caller bug and throws TypeError.
      */
-    observedStatus({ base, roster }) {
+    observedStatus({ base, roster, handNo = null } = {}) {
       if (!Array.isArray(roster) || roster.length === 0) {
         throw new TypeError('roster must be a non-empty array of addresses');
       }
+      const wanted = roster.map((a, i) => normalizeAddress(a, `roster[${i}]`));
       if (
         !base ||
         !Array.isArray(base.balances) ||
-        base.balances.length !== roster.length ||
+        base.balances.length !== wanted.length ||
+        !base.balances.every((b) => typeof b === 'bigint' && b >= 0n) ||
         !Array.isArray(base.players) ||
-        base.players.some((p, i) => p !== roster[i].toLowerCase())
+        base.players.some((p, i) => p !== wanted[i])
       ) {
         throw new TypeError('base must be the State of exactly this roster');
       }
@@ -201,8 +241,8 @@ export function createLedger({ unit, tableId } = {}) {
 
       const deltas = [];
       const seats = [];
-      for (let i = 0; i < roster.length; i++) {
-        const address = roster[i].toLowerCase();
+      for (let i = 0; i < wanted.length; i++) {
+        const address = wanted[i];
         if (table.duplicates.has(address)) {
           return blocked('duplicate-address', `${address} is shown on two seats`);
         }
@@ -218,63 +258,28 @@ export function createLedger({ unit, tableId } = {}) {
       if (rake < 0n) {
         return blocked('stacks-exceed-base', `the stacks hold ${-rake} more chips than the base`);
       }
-
-      let pot = null;
-      const key = keyOf(table.epoch, table.handNo);
-      const result = table.handNo === null ? undefined : results.get(key);
-      if (conflicts.has(`hand-end:${key}`)) {
-        return blocked(
-          'conflict',
-          `the server gave two different results for hand ${table.handNo}`,
-        );
-      }
-      if (result) {
-        // Only seats that were in the hand are compared: a seat with 0 in the result and chips on the table
-        // is one that sat down after the hand (the engine does not report it), and its stack has not moved.
-        const off = roster.findIndex(
-          (_, i) =>
-            seats[i].status === 'seated' &&
-            result.stacks[seats[i].index] > 0 &&
-            result.stacks[seats[i].index] !== seats[i].chips,
-        );
-        if (off >= 0) {
-          flag(
-            'stacks',
-            table.epoch,
-            table.handNo,
-            `seat ${seats[off].index} differs from the result`,
-          );
-          return blocked(
-            'conflict',
-            `the hand-end result and the stacks disagree on seat ${seats[off].index}`,
-          );
-        }
-        if (BigInt(result.rake) !== rake) {
-          flag(
-            'rake',
-            table.epoch,
-            table.handNo,
-            `the result took ${result.rake}, the stacks lost ${rake}`,
-          );
-          return blocked(
-            'conflict',
-            `the hand-end result took ${result.rake} chips of rake, the stacks lost ${rake}`,
-          );
-        }
-        pot = result.pot;
-      }
-      return { ok: true, observed: { deltas: deltas.map(asNumber), rake: asNumber(rake), pot } };
+      const live = liveResult(handNo, seats, rake);
+      if (live && !live.ok) return live;
+      return {
+        ok: true,
+        observed: {
+          deltas: deltas.map(asNumber),
+          rake: asNumber(rake),
+          pot: live ? live.pot : null,
+        },
+      };
     },
 
     /**
      * What happened at the table since `base`, in chips: { deltas (state order), rake, pot } where pot is a
-     * number only when the hand was watched live (else null: only the stacks are known). Null when it cannot be
-     * said: a hand in progress, a roster address no seat shows, or the server's accounts disagree
+     * number only when the named hand was watched live (else null: only the stacks are known). Null when it
+     * cannot be said: a hand in progress, a roster address no seat shows, or the server's accounts disagree
      * (observedStatus says which).
      */
     observedFor(args) {
-      const status = this.observedStatus(args);
+      const status = ledger.observedStatus(args);
       return status.ok ? status.observed : null;
     },
   };
+  return ledger;
 }
