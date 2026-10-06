@@ -2,7 +2,7 @@
 import { describe, expect, test } from 'bun:test';
 import { simulate } from './sim.js';
 
-const SEEDS = 60;
+const SEEDS = Number(process.env.PGG_SIM_SEEDS ?? 60);
 
 describe('coordinator simulation', () => {
   const totals = { bundles: 0, gates: 0 };

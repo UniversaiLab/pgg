@@ -654,3 +654,126 @@ describe('halts', () => {
     expect(c.phase).toBe('active');
   });
 });
+
+describe('gaps the mutation check found', () => {
+  test("a seat whose session key is the arbiter's, or another seat's, cannot be claimed", () => {
+    const w = makeVaultWorld();
+    const c = w.boot();
+    w.settle();
+    const [alice, bob, carol] = w.players;
+    expect(w.chain.deposit(c.tableKey, alice.wallet, 200n * UNIT, w.arbiter).ok).toBe(true);
+    expect(w.chain.deposit(c.tableKey, bob.wallet, 200n * UNIT, carol.session).ok).toBe(true);
+    w.deposit(carol, 200);
+    w.chainTick();
+    expect(w.claim(alice, { sig: w.claimSig(alice, alice.playerId, w.arbiterKey) })).toMatchObject({
+      ok: false,
+      code: ERR.BAD_CLAIM,
+    });
+    expect(w.claim(bob, { sig: w.claimSig(bob, bob.playerId, carol.sessionKey) })).toMatchObject({
+      ok: false,
+      code: ERR.BAD_CLAIM,
+    });
+  });
+
+  test('a key past its policy age in one jump: the server refuses to co-sign anything (S3) and halts', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob] = w.players;
+    w.playHand({ winner: alice, loser: bob });
+    w.advanceChain(w.cfg.policy.policyMaxMs / 1000 + 1);
+    w.tick(1);
+    expect(c.halt).toMatchObject({ cause: 'key-expired', fatal: true });
+    expect(w.proposals.map((p) => p.nonce)).toEqual([1n]);
+  });
+
+  test('a key about to expire keeps the table from starting an epoch with it', () => {
+    const w = makeVaultWorld();
+    const c = w.boot();
+    w.settle();
+    for (const p of w.players) w.deposit(p, 200);
+    w.chainTick();
+    for (const p of w.players) w.claim(p);
+    w.advanceChain((w.cfg.policy.policyMaxMs - w.cfg.policy.policyMarginMs) / 1000);
+    w.startEpoch();
+    // not started at all (an epoch that started would rotate the old keys out at once and look the same)
+    expect(c.phase).toBe('filling');
+    expect(c.publicView().epoch).toBe(0);
+    expect(w.proposals).toEqual([]);
+    expect(w.chain.table(c.tableKey)).toMatchObject({ status: 'Filling', nonce: 0n });
+  });
+
+  test('after a restart in filling the start hold is honoured again, then the table starts', () => {
+    const w = makeVaultWorld();
+    w.boot();
+    w.settle();
+    for (const p of w.players) w.deposit(p, 200);
+    w.chainTick();
+    w.restart();
+    for (const p of w.players) w.claim(p);
+    w.tick(w.cfg.policy.startHoldMs - 1);
+    w.settle();
+    expect(w.coordinator.phase).toBe('filling');
+    w.tick(1);
+    w.settle();
+    expect(w.coordinator.phase).toBe('active');
+  });
+
+  test('a leave asked while the final settles is honoured in the next epoch', () => {
+    const w = makeVaultWorld();
+    const c = w.activate({ chips: [100, 100, 100] });
+    const [alice, bob, carol] = w.players;
+    w.playHand({ winner: alice, loser: bob, amount: 100 }); // bob busts: a final keeping alice and carol
+    expect(c.phase).toBe('settling');
+    expect(c.requestLeave(carol.playerId).ok).toBe(true); // too late for this final
+    carol.client.intent = 'leave';
+    carol.client.leaveAckNonce = 1n;
+    w.settle();
+    expect(c.phase).toBe('filling');
+    // epoch 2 starts with alice and carol; carol still wants out and alice cannot play alone, so the epoch
+    // ends at once with a standalone final that pays carol, and it settles
+    w.startEpoch();
+    const final = lastBundle(w).state;
+    expect(final).toMatchObject({
+      nonce: 2n,
+      isFinal: true,
+      players: [alice.wallet, carol.wallet].sort(),
+    });
+    expect(final.keep[final.players.indexOf(carol.wallet)]).toBe(false);
+    expect(final.keep[final.players.indexOf(alice.wallet)]).toBe(true);
+    expect(w.chain.table(c.tableKey)).toMatchObject({ status: 'Filling', nonce: 2n, seated: 1 });
+    expect(w.host.unseats.map((u) => u.address)).toEqual([bob.wallet, carol.wallet]);
+    noRefusals(w);
+  });
+
+  test('exit recovery never keeps a seat that went bust during the exit (dust alone keeps nothing)', () => {
+    const w = makeVaultWorld();
+    const c = w.activate({ chips: [100, 100, 100], dust: [0n, 3n, 0n] });
+    const [alice, bob, carol] = w.players;
+    w.playHand({ winner: alice, loser: carol, amount: 10 });
+    carol.client.mode = 'manual';
+    w.playHand({ winner: carol, loser: alice, amount: 5 });
+    w.tick(w.cfg.policy.signTimeoutMs + w.cfg.policy.stallExitMs);
+    w.settle();
+    expect(c.phase).toBe('exiting');
+    w.disconnect(alice); // no recovery yet
+    carol.client.mode = 'auto';
+    w.signHeld(carol);
+    w.settle();
+    // a hand that was in flight ends during the exit: bob loses everything to carol; its state is proposed as it is
+    const take = bob.chips;
+    bob.chips = 0;
+    carol.chips += take;
+    for (const p of w.seated) if (p.connected) p.client.watched.pot += take * 2;
+    alice.client.watched.missed = true;
+    c.onHandEnd(w.snapshot({ pot: take * 2 }));
+    c.flush();
+    w.pump();
+    w.connect(alice);
+    w.settle();
+    const final = lastBundle(w).state;
+    expect(final.isFinal).toBe(true);
+    expect(final.keep[final.players.indexOf(bob.wallet)]).toBe(false);
+    expect(final.balances[final.players.indexOf(bob.wallet)]).toBe(3n);
+    noRefusals(w);
+  });
+});
