@@ -865,7 +865,10 @@ export class VaultCoordinator {
       sessionKeys: null,
       base: null,
       depositors: stayers,
-      leaving: [],
+      // a kept member who asked to leave after this final was proposed still wants out: the next epoch's
+      // first rotation pays them (their client refuses any final that keeps them, so dropping the request
+      // would stall that epoch)
+      leaving: this.#rec.leaving.filter((a) => stayers.includes(a)),
       dust: {},
       roundMeta: null,
       stallExit: null,

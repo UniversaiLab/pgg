@@ -62,7 +62,23 @@ describe('rotationDecision: reasons', () => {
     ],
     ['exactly the minimum hands is enough', { leaveRequests: [B], handsInEpoch: 3 }, 'leave'],
     ['drain after the minimum hands', { drain: true }, 'drain'],
-    ['drain before the minimum hands waits', { drain: true, handsInEpoch: 0 }, null],
+    // drain kicks everyone, so nobody could play on: it does not wait for the minimum
+    ['drain before the minimum hands does not wait', { drain: true, handsInEpoch: 0 }, 'drain'],
+    [
+      'heads-up, one asks to leave before the minimum: nobody is left to play, so it does not wait',
+      { entries: entries([100, 100, 0]).slice(0, 2), leaveRequests: [A], handsInEpoch: 1 },
+      'leave',
+    ],
+    [
+      'two of three leave before the minimum: one player cannot play alone',
+      { leaveRequests: [A, B], handsInEpoch: 1 },
+      'leave',
+    ],
+    [
+      'idle kicks that leave one player do not wait either',
+      { entries: entries(undefined, [{ idleHands: 3 }, { idleHands: 3 }]), handsInEpoch: 0 },
+      'idle',
+    ],
     ['idle for idleKickHands hands', { entries: entries(undefined, [{ idleHands: 3 }]) }, 'idle'],
     ['idle for one hand fewer is not', { entries: entries(undefined, [{ idleHands: 2 }]) }, null],
     [

@@ -19,8 +19,9 @@
 //   leave        voluntary  a member asked to leave
 //   idle         voluntary  a member sat out idleKickHands hands in a row while still connected
 // A forced reason rotates at once; a voluntary one waits until the epoch has had minEpochHands hands, so a
-// table does not pay a settle for every whim. Whoever is leaving or kicked is out of ANY rotation that
-// happens, whatever its reason, because the final is the only exit that costs nothing.
+// table does not pay a settle for every whim, unless fewer than two members could play on (then no hand
+// would ever come). Whoever is leaving or kicked is out of ANY rotation that happens, whatever its reason,
+// because the final is the only exit that costs nothing.
 
 export const ROTATION_REASONS = Object.freeze(['maintenance', 'bust', 'drain', 'leave', 'idle']);
 export const FORCED_REASONS = Object.freeze(['maintenance', 'bust']);
@@ -145,16 +146,21 @@ export function rotationDecision({
     leave: seats.some((s) => s.leaving),
     idle: seats.some((s) => s.idle),
   };
+  const kicked = seats.filter((s) => drain || s.idle || s.keyExpired).map((s) => s.address);
+  const leaving = seats.filter((s) => s.leaving).map((s) => s.address);
+  const out = new Set([...kicked, ...leaving]);
+
+  // The minimum only paces a table that can play on: once fewer than two members could still be dealt in
+  // (everyone else is leaving, kicked or bust), no hand will ever reach it, and waiting would hold the
+  // leavers until maintenance.
+  const playable = seats.filter((s) => s.chips > 0 && !out.has(s.address)).length;
   const forced = FORCED_REASONS.find((reason) => due[reason]) ?? null;
   const voluntary =
-    handsInEpoch >= c.minEpochHands
+    handsInEpoch >= c.minEpochHands || playable < 2
       ? (ROTATION_REASONS.find((reason) => !FORCED_REASONS.includes(reason) && due[reason]) ?? null)
       : null;
   const reason = forced ?? voluntary;
 
-  const kicked = seats.filter((s) => drain || s.idle || s.keyExpired).map((s) => s.address);
-  const leaving = seats.filter((s) => s.leaving).map((s) => s.address);
-  const out = new Set([...kicked, ...leaving]);
   return {
     rotate: reason !== null,
     reason,
