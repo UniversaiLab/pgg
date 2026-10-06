@@ -52,7 +52,7 @@ export class HostProxy {
  *   config.policy  server-wide knobs: tickMs, rereadMs, challengeMarginSec (each table's own policy wins
  *                  for everything else)
  * Returns { start, close, tick, reread, coordinator(tableId), coordinators(), attachHost(tableId, host),
- *   resolver }.
+ *   resolver, rereadFailures }.
  */
 export function createVaultRuntime({ store, chain, signer, clock, hostFactory, config }) {
   if (!config || !Array.isArray(config.tables)) throw new TypeError('config.tables is required');
@@ -94,14 +94,18 @@ export function createVaultRuntime({ store, chain, signer, clock, hostFactory, c
     tick();
     tickTimer = clock.setTimeout(tickLoop, policy.tickMs);
   };
+  const failures = [];
   const rereadLoop = () => {
     rereadTimer = null;
     if (closed) return;
     try {
       reread();
-    } finally {
-      rereadTimer = clock.setTimeout(rereadLoop, policy.rereadMs);
+    } catch (error) {
+      // an RPC outage must not escape a timer (that would take the process down): note it, try again later
+      failures.push({ at: clock.now(), error: String(error?.message ?? error) });
+      if (failures.length > 50) failures.shift();
     }
+    rereadTimer = clock.setTimeout(rereadLoop, policy.rereadMs);
   };
 
   return {
@@ -133,6 +137,11 @@ export function createVaultRuntime({ store, chain, signer, clock, hostFactory, c
 
     get closed() {
       return closed;
+    },
+
+    /** Re-reads of the chain view that failed: [{ at, error }], newest last. */
+    get rereadFailures() {
+      return [...failures];
     },
 
     tick,
