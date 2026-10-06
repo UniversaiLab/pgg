@@ -61,7 +61,7 @@ import {
 import { keyExpiring, rotationDecision } from './policy.js';
 import { ALARMS, nextChainAction, stallAction } from './reconcile.js';
 import { SignRound } from './round.js';
-import { DoubleSignError } from './store.js';
+import { DoubleSignError, encodeJson } from './store.js';
 import { POLICY_DEFAULTS } from './vault-config.js';
 
 /**
@@ -487,8 +487,9 @@ export class VaultCoordinator {
     if (!record) record = this.#store.saveTable(this.#freshRecord(1));
     this.#adopt(record);
 
-    // A changed unit silently changes everyone's chip count: refuse to resume rather than guess.
-    if (json(record.pinned) !== json(this.#pinned())) {
+    // A changed unit silently changes everyone's chip count: refuse to resume rather than guess. Compared
+    // canonically: the store hands records back with their keys sorted.
+    if (encodeJson(record.pinned) !== encodeJson(this.#pinned())) {
       this.#haltWith('pinned-changed', {
         detail: `stored ${json(record.pinned)}, configured ${json(this.#pinned())}`,
       });
