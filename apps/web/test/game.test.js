@@ -3,10 +3,13 @@ import {
   addToast,
   applyServerMessage,
   dismissToast,
+  errorText,
   heroEntry,
   initialState,
   isHeroTurn,
   markProof,
+  setVault,
+  vaultHere,
 } from '../src/lib/game.js';
 
 const table = (over = {}) => ({
@@ -173,5 +176,39 @@ describe('applyServerMessage', () => {
     expect(isHeroTurn(s)).toBe(true);
     expect(isHeroTurn(apply(s, tbl(2, { toAct: 0 })))).toBe(false);
     expect(isHeroTurn(apply(s, tbl(2, { toAct: null })))).toBe(false);
+  });
+});
+
+describe('vault state', () => {
+  test('setVault stores what the controller reports for a table; vaultHere shows it only at that table', () => {
+    const at = { ...initialState, tableId: 'vault-1' };
+    const next = setVault(at, 'vault-1', { epoch: 1, signedNonce: '4' });
+    expect(next.vault).toEqual({ tableId: 'vault-1', epoch: 1, signedNonce: '4' });
+    expect(vaultHere(next)).toEqual(next.vault);
+    expect(vaultHere({ ...next, tableId: 't1' })).toBeNull();
+    expect(setVault(next, 'vault-1', null).vault).toBeNull();
+    expect(vaultHere(initialState)).toBeNull();
+  });
+
+  test('an unseat keeps the vault state (a failure stays on screen); every vault error has words', () => {
+    const at = setVault({ ...initialState, tableId: 'vault-1', phase: 'table' }, 'vault-1', {
+      failure: { kind: 'equivocation' },
+    });
+    const after = applyServerMessage(at, {
+      t: 'unseated',
+      tableId: 'vault-1',
+      reason: 'settled',
+      chips: 10,
+    });
+    expect(after.vault).toEqual(at.vault);
+    for (const code of [
+      'not-vault-table',
+      'bad-claim',
+      'claim-pending',
+      'bad-signature',
+      'vault-locked',
+    ]) {
+      expect(errorText(code)).not.toBe('Something went wrong');
+    }
   });
 });

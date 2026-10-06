@@ -1,6 +1,11 @@
 // A WebSocket that reconnects by itself and measures round-trip time and clock skew (the turn
 // timer is drawn from the SERVER's deadline, so the client needs to know how far off its own clock is).
 // Everything environmental is injectable, so tests run it with a fake socket and fake timers.
+//
+// Phones freeze background pages: timers stop, and the back-off can leave a returning player waiting for
+// seconds. When the page becomes visible again (or is restored from the back/forward cache, or the network
+// comes back) a closed socket reconnects at once. At a vault table that matters: the open signreq is re-sent
+// on reconnect, and a quick answer keeps the table out of a stall.
 
 import { CLIENT, CLOSE, SERVER } from '@pgg/protocol/constants';
 
@@ -20,6 +25,9 @@ export class GameSocket {
   #retry = null;
   #pinger = null;
   #pingSentAt = 0;
+  #doc;
+  #win;
+  #listening = false;
   rtt = 0;
   skew = 0; // serverTime - clientTime, in ms
 
@@ -36,6 +44,8 @@ export class GameSocket {
     },
     random = Math.random,
     now = Date.now,
+    doc = globalThis.document,
+    win = globalThis.window,
   }) {
     this.#makeUrl = typeof url === 'function' ? url : () => url;
     this.#onMessage = onMessage;
@@ -44,6 +54,8 @@ export class GameSocket {
     this.#timers = timers;
     this.#random = random;
     this.#now = now;
+    this.#doc = doc ?? null;
+    this.#win = win ?? null;
   }
 
   get open() {
@@ -57,11 +69,13 @@ export class GameSocket {
 
   connect() {
     this.#wanted = true;
+    this.#listen(true);
     this.#open();
   }
 
   close() {
     this.#wanted = false;
+    this.#listen(false);
     this.#stopTimers();
     this.#ws?.close(1000);
     this.#ws = null;
@@ -103,17 +117,38 @@ export class GameSocket {
       if (!this.#wanted) return;
       if (event.code === CLOSE.REPLACED) {
         this.#wanted = false;
+        this.#listen(false);
         this.#onStatus('replaced'); // another tab or device took this session over
         return;
       }
       if (event.code === CLOSE.UNAUTHORIZED) {
         this.#wanted = false;
+        this.#listen(false);
         this.#onStatus('unauthorized');
         return;
       }
       this.#schedule();
     };
     ws.onerror = () => {}; // onclose always follows and does the work
+  }
+
+  // Back in front, restored, or online again: a socket waiting out its back-off reconnects now.
+  #wake = () => {
+    if (!this.#wanted || this.#ws) return;
+    if (this.#doc?.visibilityState === 'hidden') return;
+    if (this.#retry !== null) this.#timers.clearTimeout(this.#retry);
+    this.#retry = null;
+    this.#attempt = 0;
+    this.#open();
+  };
+
+  #listen(on) {
+    if (on === this.#listening) return;
+    this.#listening = on;
+    const method = on ? 'addEventListener' : 'removeEventListener';
+    this.#doc?.[method]?.('visibilitychange', this.#wake);
+    this.#win?.[method]?.('pageshow', this.#wake);
+    this.#win?.[method]?.('online', this.#wake);
   }
 
   #schedule() {

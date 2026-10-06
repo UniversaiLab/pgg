@@ -196,3 +196,80 @@ describe('GameSocket', () => {
     expect(socket.open).toBe(true);
   });
 });
+
+// document and window stand-ins: listeners by event name
+class FakeTarget {
+  listeners = new Map();
+  visibilityState = 'visible';
+  addEventListener(name, fn) {
+    if (!this.listeners.has(name)) this.listeners.set(name, new Set());
+    this.listeners.get(name).add(fn);
+  }
+  removeEventListener(name, fn) {
+    this.listeners.get(name)?.delete(fn);
+  }
+  fire(name) {
+    for (const fn of this.listeners.get(name) ?? []) fn();
+  }
+  count() {
+    return [...this.listeners.values()].reduce((n, set) => n + set.size, 0);
+  }
+}
+
+describe('GameSocket: a page that comes back reconnects at once', () => {
+  test('visible again, restored from the cache, or back online: no waiting out the back-off', () => {
+    for (const [target, event] of [
+      ['doc', 'visibilitychange'],
+      ['win', 'pageshow'],
+      ['win', 'online'],
+    ]) {
+      FakeWebSocket.instances = [];
+      const doc = new FakeTarget();
+      const win = new FakeTarget();
+      const { socket, timers } = make({ doc, win });
+      socket.connect();
+      last().open();
+      for (let i = 0; i < 4; i++) last().drop(); // a few failed attempts: the back-off is now long
+      timers.advance(400 + 800 + 1600);
+      last().drop();
+      const before = FakeWebSocket.instances.length;
+      (target === 'doc' ? doc : win).fire(event);
+      expect(FakeWebSocket.instances.length).toBe(before + 1);
+      last().open();
+      expect(socket.open).toBe(true);
+      expect(timers.pending).toBe(1); // only the pinger: the old retry timer was cancelled
+    }
+  });
+
+  test('a hidden page, an open socket, or a connection already being made is left alone', () => {
+    const doc = new FakeTarget();
+    const win = new FakeTarget();
+    const { socket } = make({ doc, win });
+    socket.connect();
+    doc.fire('visibilitychange'); // still connecting
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    last().open();
+    win.fire('pageshow'); // open
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    last().drop();
+    doc.visibilityState = 'hidden';
+    doc.fire('visibilitychange');
+    expect(FakeWebSocket.instances).toHaveLength(1); // waits for its retry
+  });
+
+  test('close() and a replaced or unauthorized session stop listening', () => {
+    const doc = new FakeTarget();
+    const win = new FakeTarget();
+    const { socket } = make({ doc, win });
+    socket.connect();
+    expect(doc.count() + win.count()).toBe(3);
+    socket.close();
+    expect(doc.count() + win.count()).toBe(0);
+    socket.connect();
+    last().open();
+    last().drop(4000);
+    expect(doc.count() + win.count()).toBe(0);
+    doc.fire('visibilitychange');
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+});

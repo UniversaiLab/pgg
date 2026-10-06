@@ -22,6 +22,9 @@ export const initialState = Object.freeze({
   proofs: [], // fairness proofs received, newest first
   toasts: [], // { id, text, tone }
   nextId: 1,
+  // Vault tables only: what this device's signer reports for the table it is at (lib/vault.js uiState plus
+  // the table id). Kept through an unseat: a failure stays on screen until the chain says the table is done.
+  vault: null,
 });
 
 export const addToast = (state, text, tone = 'info') => ({
@@ -47,6 +50,11 @@ const ERROR_TEXT = {
   'already-seated': 'You are already seated at a table',
   'rate-limited': 'Slow down a little',
   'rebuy-not-allowed': 'You can add chips between hands',
+  'not-vault-table': 'That is not a vault table',
+  'bad-claim': 'This device could not prove your seat at that table',
+  'claim-pending': 'Your deposit is still being confirmed — trying again shortly',
+  'bad-signature': 'The table could not use your signature',
+  'vault-locked': 'This table is paused for now',
 };
 
 export function errorText(code) {
@@ -126,6 +134,15 @@ export function applyServerMessage(state, message) {
       return state;
   }
 }
+
+/** What the vault controller reports for `tableId` (null clears it). */
+export function setVault(state, tableId, vault) {
+  return { ...state, vault: vault === null ? null : { tableId, ...vault } };
+}
+
+/** The vault state of the table the player is at, or null (play-money tables never have one). */
+export const vaultHere = (state) =>
+  state.vault && state.vault.tableId === state.tableId ? state.vault : null;
 
 /** Record whether a fairness proof checked out. */
 export function markProof(state, handNo, ok) {
