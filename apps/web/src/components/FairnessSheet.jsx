@@ -22,7 +22,7 @@ function Status({ ok }) {
 }
 
 /** Every hand ends with a proof; the app checks each one on this phone and lists the outcome. */
-export function FairnessSheet({ open, onClose, proofs, next }) {
+export function FairnessSheet({ open, onClose, proofs, next, signed = null }) {
   const [openRow, setOpenRow] = useState(null);
   return (
     <Sheet open={open} onClose={onClose} title="Fair play">
@@ -30,6 +30,14 @@ export function FairnessSheet({ open, onClose, proofs, next }) {
         Before each hand the table commits to a secret shuffle. After the hand it shows you the
         secret, and your phone checks that the cards were never changed.
       </p>
+      {signed && (
+        <div className="mb-4 rounded-2xl bg-raised p-3.5">
+          <div className="text-xs font-bold uppercase tracking-wider text-faint">
+            Kept on this phone, signed by every player
+          </div>
+          <div className="mt-1 text-[15px] font-bold text-white">{signed}</div>
+        </div>
+      )}
       {next && (
         <div className="mb-4 rounded-2xl bg-raised p-3.5">
           <div className="text-xs font-bold uppercase tracking-wider text-faint">

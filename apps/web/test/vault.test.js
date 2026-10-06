@@ -231,6 +231,14 @@ describe('a vault session through the client', () => {
     expect(record.leaveAckNonce).toBe('0');
   });
 
+  test('a reconnect brings a new welcome, and the seat is claimed again', async () => {
+    const s = await session({ seed: 13 });
+    await s.deliver(s.welcome);
+    await s.deliver(s.epoch);
+    await s.deliver(s.welcome); // the server restarted, or the socket reconnected
+    expect(s.socket.sent.filter((m) => m.t === CLIENT.CLAIM)).toHaveLength(2);
+  });
+
   test('a pending claim (deposit not confirmed yet) is retried, once at a time', async () => {
     const s = await session({ seed: 11 });
     await s.deliver(s.welcome);

@@ -38,7 +38,7 @@ function Waiting({ children }) {
   );
 }
 
-export function ActionBar({ table, hero, heroTurn, onAct, onBack, pending }) {
+export function ActionBar({ table, hero, heroTurn, onAct, onBack, pending, waitText = null }) {
   const [raising, setRaising] = useState(false);
   const legal = table.legal;
 
@@ -51,7 +51,8 @@ export function ActionBar({ table, hero, heroTurn, onAct, onBack, pending }) {
     );
   }
   if (hero.status === 'waiting') return <Waiting>You'll be dealt in next hand</Waiting>;
-  if (!table.inHand) return <Waiting>Next hand is about to start…</Waiting>;
+  // at a vault table the next hand may wait for signatures or for an absent player: say which
+  if (!table.inHand) return <Waiting>{waitText ?? 'Next hand is about to start…'}</Waiting>;
   if (hero.folded) return <Waiting>You folded — waiting for the hand to finish</Waiting>;
   if (hero.allIn) return <Waiting>You're all in — good luck!</Waiting>;
   if (!heroTurn || !legal) {

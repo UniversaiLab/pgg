@@ -23,6 +23,7 @@ export function MenuSheet({
   onAddChips,
   onFairness,
   onLeave,
+  vaultTable = false,
 }) {
   return (
     <Sheet open={open} onClose={onClose} title="Table">
@@ -47,6 +48,15 @@ export function MenuSheet({
         >
           Vibration
         </Row>
+        {vaultTable && (
+          <div
+            aria-disabled="true"
+            className="flex h-14 w-full items-center justify-between rounded-2xl bg-raised px-4 text-[16px] font-bold text-faint"
+          >
+            Exit and withdraw
+            <span className="text-xs font-semibold">needs a wallet · coming next</span>
+          </div>
+        )}
         <Row onClick={onLeave} tone="text-red-soft">
           Leave table
         </Row>

@@ -178,6 +178,30 @@ describe('the honest table', () => {
     expect(t.sigs()).toHaveLength(1);
   });
 
+  test('a reload: the epoch and the bundle re-sent back to back, the bundle is kept', async () => {
+    const t = setup();
+    const { w, alice, controller, epoch } = t;
+    await controller.handle(epoch);
+    await pinOthers(w, epoch);
+    const first = await hand(t, { winner: w.clients[0], loser: w.clients[1], amount: 10, rake: 1 });
+    w.server.collect(alice, fromSigMessage(t.sigs().at(-1)));
+    othersSign(w, first.req);
+    const bundle = w.server.bundle();
+    // the page reloads: a new controller over the same storage, the server re-sends the epoch and the bundle
+    const reloaded = createVaultController({
+      storage: alice.storage,
+      chainView: w.chain,
+      send: () => true,
+      locks: null,
+      tabId: 'tab-a',
+    });
+    reloaded.setContext({ playerId: 'p-alice', tables: [summaryOf(w)] });
+    reloaded.handle(epoch); // not awaited, as messages arrive
+    reloaded.handle(bundle);
+    await reloaded.settled();
+    expect(reloaded.state(GAME_TABLE).bundleNonce).toBe('1');
+  });
+
   test('Leave: the head the server showed is recorded, so a final that keeps me is refused later', async () => {
     const t = setup();
     const { w, alice, controller, epoch } = t;
@@ -332,7 +356,8 @@ describe('a hostile server gets no signature', () => {
       tables: [summaryOf(loose.w, { maxRakeBps: 10_000 })],
     });
     await loose.controller.handle(loose.epoch);
-    // 3 chips on a 20-chip pot is 1500 bps: above the contract's 500 whatever the server says
+    // 3 chips on a 20-chip pot is 1500 bps: above the contract's 500 whatever the server says. The epoch was
+    // still pinned (the server's figure is not used, so it cannot break the check either): the refusal is C1e
     await hand(loose, {
       winner: loose.w.clients[0],
       loser: loose.w.clients[1],
@@ -340,6 +365,11 @@ describe('a hostile server gets no signature', () => {
       rake: 3,
     });
     expect(loose.sigs()).toEqual([]);
+    expect(loose.controller.state(GAME_TABLE)).toMatchObject({
+      epoch: 1,
+      epochProblem: null,
+      refused: { rule: 'C1e' },
+    });
   });
 });
 

@@ -2,8 +2,10 @@ import { AnimatePresence, m } from 'motion/react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useClient, useGame } from '../client-context.js';
 import { chips as short } from '../lib/format.js';
+import { vaultHere } from '../lib/game.js';
 import { setHaptics } from '../lib/haptics.js';
 import { tableGeometry, towardCenter } from '../lib/seats.js';
+import { signedLabel, vaultAlarm, waitingText } from '../lib/vault-ui.js';
 import { ActionBar } from './ActionBar.jsx';
 import { Chips } from './AnimatedNumber.jsx';
 import { Board } from './Board.jsx';
@@ -14,6 +16,7 @@ import { MenuSheet } from './MenuSheet.jsx';
 import { ResultBanner } from './ResultBanner.jsx';
 import { Seat } from './Seat.jsx';
 import { Button, Sheet } from './Sheet.jsx';
+import { VaultBanner } from './VaultBanner.jsx';
 
 function useBox(ref) {
   const [box, setBox] = useState({ w: 360, h: 560 });
@@ -121,7 +124,10 @@ export function Table() {
   const reveals = new Map((result?.reveals ?? []).map((r) => [r.seat, r.cards]));
   const winners = new Set((result?.payouts ?? []).filter((p) => p.net > 0).map((p) => p.seat));
   const handKey = table.handNo ?? 0;
-  const proofsBad = proofs.some((p) => p.ok === false);
+  const vault = vaultHere(game);
+  const isVault = Boolean(table.vault);
+  // a vault failure turns the shield red too, like a proof that failed
+  const proofsBad = proofs.some((p) => p.ok === false) || vaultAlarm(vault);
   const playersReady = table.seats.filter((s) => s && s.status !== 'sitout').length;
   const dealing = table.inHand && table.board.length === 0 && table.round === 'preflop';
 
@@ -169,6 +175,8 @@ export function Table() {
           </button>
         </div>
       </header>
+
+      {isVault && <VaultBanner table={table} vault={vault} />}
 
       <div ref={feltRef} className="felt relative min-h-0 flex-1 overflow-hidden">
         <div className="felt-rim" />
@@ -296,6 +304,7 @@ export function Table() {
           onAct={act}
           onBack={() => client.back()}
           pending={pending}
+          waitText={isVault ? waitingText(table, serverNow) : null}
         />
       </footer>
 
@@ -307,7 +316,9 @@ export function Table() {
           setVibration(!vibration);
           setHaptics(!vibration);
         }}
+        vaultTable={isVault}
         canAddChips={
+          !isVault &&
           Boolean(summary) &&
           hero &&
           (hero.status !== 'seated' || !table.inHand) &&
@@ -322,12 +333,15 @@ export function Table() {
         onClose={() => setSheet(null)}
         proofs={proofs}
         next={table.fairness.next}
+        signed={signedLabel(vault)}
       />
       <Sheet open={sheet === 'leave'} onClose={() => setSheet(null)} title="Leave this table?">
         <p className="-mt-1 mb-5 text-muted">
-          {table.inHand && hero?.hasCards
-            ? 'You will fold this hand and your chips return to your balance when it ends.'
-            : 'Your chips return to your balance.'}
+          {isVault
+            ? 'Your chips are paid out on chain when this round of the table ends, usually after the next hand.'
+            : table.inHand && hero?.hasCards
+              ? 'You will fold this hand and your chips return to your balance when it ends.'
+              : 'Your chips return to your balance.'}
         </p>
         <div className="grid grid-cols-2 gap-3">
           <Button tone="dark" onClick={() => setSheet(null)}>
