@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test';
 import { ERR, SERVER } from '@pgg/protocol/constants';
 import { fromWire, hashState, signDigest } from '@pgg/vault';
 import { makeJobKey } from '../../src/vault/chain-port.js';
+import { DoubleSignError } from '../../src/vault/store.js';
 import { makeVaultWorld, UNIT } from './harness.js';
 
 const noRefusals = (w) => {
@@ -358,5 +359,285 @@ describe('jobs and phases', () => {
     w.settle();
     expect(w.store.getJob(key).status).toBe('done');
     expect(c.phase).toBe('filling');
+  });
+});
+
+describe('stalls and stall exits (section 6)', () => {
+  const P = (w) => w.cfg.policy;
+
+  test('a silent member: soft deadline, resends to connected members only, then startExit with the newest bundle', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob, carol] = w.players;
+    w.playHand({ winner: alice, loser: bob, amount: 30, rake: 1 }); // bundle 1
+    carol.client.mode = 'manual';
+    w.playHand({ winner: bob, loser: alice, amount: 10 }); // round 2 stays open
+    expect(sentTo(w, carol, SERVER.SIGN_REQ).filter((m) => m.state.nonce === '2')).toHaveLength(1);
+    w.tick(P(w).resendMs[0]);
+    expect(sentTo(w, carol, SERVER.SIGN_REQ).filter((m) => m.state.nonce === '2')).toHaveLength(2);
+    w.disconnect(carol);
+    w.tick(P(w).resendMs[1] - P(w).resendMs[0]);
+    expect(sentTo(w, carol, SERVER.SIGN_REQ).filter((m) => m.state.nonce === '2')).toHaveLength(2); // offline: no resend
+    expect(c.phase).toBe('active');
+    w.tick(P(w).signTimeoutMs - P(w).resendMs[1]);
+    expect(c.phase).toBe('stalled');
+    w.tick(P(w).stallExitMs - 1);
+    expect(w.chain.table(c.tableKey).status).toBe('Active');
+    w.tick(1);
+    w.settle();
+    const row = w.chain.table(c.tableKey);
+    expect(row).toMatchObject({ status: 'Exiting', nonce: 1n });
+    expect(row.exitDigest).toBe(hashState(w.bundles[0].bundle.state, w.domain));
+    expect(c.phase).toBe('exiting');
+    expect(c.canDeal()).toBe(false);
+  });
+
+  test('a late signature while a member is still away: the newer bundle challenges the exit, which then pays it out', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob, carol] = w.players;
+    w.playHand({ winner: alice, loser: bob, amount: 30, rake: 1 });
+    carol.client.mode = 'manual';
+    w.playHand({ winner: bob, loser: alice, amount: 10 });
+    w.tick(P(w).signTimeoutMs + P(w).stallExitMs);
+    w.settle();
+    expect(w.chain.table(c.tableKey)).toMatchObject({ status: 'Exiting', nonce: 1n });
+    w.disconnect(alice); // so the table cannot recover: the exit runs its course
+    carol.client.mode = 'auto';
+    w.signHeld(carol);
+    w.settle();
+    const raised = w.bundles.at(-1).bundle.state;
+    expect(raised).toMatchObject({ nonce: 2n, isFinal: false });
+    expect(w.chain.table(c.tableKey)).toMatchObject({ status: 'Exiting', nonce: 2n });
+    expect(w.chain.table(c.tableKey).exitDigest).toBe(hashState(raised, w.domain));
+    w.advanceChain(w.chain.info.exitWindowSec + 1);
+    w.settle();
+    for (const p of w.players) {
+      const u = w.host.unseats.find((x) => x.address === p.wallet);
+      expect(u).toMatchObject({ reason: 'closed' });
+      expect(BigInt(u.chips) * UNIT).toBe(raised.balances[raised.players.indexOf(p.wallet)]);
+    }
+  });
+
+  test('every member back inside the window: exit recovery proposes a final keeping everyone, and settles it', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob, carol] = w.players;
+    w.playHand({ winner: alice, loser: bob, amount: 30, rake: 1 });
+    carol.client.mode = 'manual';
+    w.playHand({ winner: bob, loser: alice, amount: 10 });
+    w.tick(P(w).signTimeoutMs + P(w).stallExitMs);
+    w.settle();
+    expect(c.phase).toBe('exiting');
+    carol.client.mode = 'auto';
+    w.signHeld(carol);
+    w.settle();
+    const final = lastBundle(w).state;
+    expect(final).toMatchObject({ nonce: 3n, isFinal: true, keep: [true, true, true] });
+    expect(sentTo(w, alice, SERVER.SIGN_REQ).at(-1).reason).toBe('exit-recovery');
+    w.settle();
+    expect(w.chain.table(c.tableKey)).toMatchObject({ status: 'Filling', nonce: 3n });
+    expect(c.phase).toBe('filling');
+    expect(w.host.unseats).toEqual([]);
+    noRefusals(w);
+  });
+
+  test('a late signature before the exit job is sent stops the exit (the guard re-reads the record)', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob, carol] = w.players;
+    w.playHand({ winner: alice, loser: bob });
+    carol.client.mode = 'manual';
+    w.playHand({ winner: bob, loser: alice });
+    w.tick(P(w).signTimeoutMs + P(w).stallExitMs); // the stall exit is decided and queued, not yet mined
+    expect(w.chain.queued.length).toBeGreaterThan(0);
+    carol.client.mode = 'auto';
+    w.signHeld(carol);
+    w.chainTick();
+    expect(w.chain.table(c.tableKey).status).toBe('Active');
+    expect(c.phase).toBe('active');
+    expect(c.canDeal()).toBe(true);
+  });
+
+  test('a stall in the first round of an epoch exits from the deposits, and the closed table moves to a new generation', () => {
+    const w = makeVaultWorld();
+    const c = w.activate({ chips: [300, 200, 100], dust: [0n, 9n, 0n] });
+    const [alice, bob, carol] = w.players;
+    const firstKey = c.tableKey;
+    carol.client.mode = 'manual';
+    w.playHand({ winner: alice, loser: bob });
+    w.tick(P(w).signTimeoutMs + P(w).stallExitMs);
+    w.settle();
+    expect(w.chain.table(firstKey)).toMatchObject({ status: 'Exiting', nonce: 0n });
+    expect(c.phase).toBe('exiting');
+    // nobody signs: after the window the deposit state is paid out and the table is Closed
+    w.advanceChain(w.chain.info.exitWindowSec + 1);
+    w.settle();
+    expect(w.chain.table(firstKey).status).toBe('Closed');
+    expect(w.host.unseats.map((u) => [u.address, u.reason, u.chips]).sort()).toEqual(
+      [
+        [alice.wallet, 'closed', 300],
+        [bob.wallet, 'closed', 200],
+        [carol.wallet, 'closed', 100],
+      ].sort(),
+    );
+    expect(w.chain.balances.of(bob.wallet)).toBeGreaterThanOrEqual(200n * UNIT + 9n);
+    // generation 2: a new tableKey, created from scratch
+    expect(c.tableKey).not.toBe(firstKey);
+    expect(c.phase).toBe('filling');
+    expect(w.chain.table(c.tableKey)).toMatchObject({ status: 'Filling' });
+  });
+
+  test('a member away between hands closes the gate; after absentGraceMs the table is stalled, then it exits', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob] = w.players;
+    w.playHand({ winner: alice, loser: bob });
+    w.disconnect(bob);
+    w.tick(P(w).absentGraceMs - 1);
+    expect(c.phase).toBe('active');
+    w.tick(1);
+    expect(c.phase).toBe('stalled');
+    // back in time: active again, nothing happens
+    w.connect(bob);
+    w.tick(1);
+    expect(c.phase).toBe('active');
+    w.disconnect(bob);
+    w.tick(P(w).absentGraceMs + P(w).stallExitMs);
+    w.settle();
+    expect(w.chain.table(c.tableKey)).toMatchObject({ status: 'Exiting', nonce: 1n });
+  });
+});
+
+describe('halts', () => {
+  test('a snapshot the coordinator cannot read halts the table and never throws', () => {
+    for (const snapshot of [
+      null,
+      { handNo: 1, result: { pot: 1, rake: 2 }, entries: [] },
+      { handNo: -1, result: { pot: 0, rake: 0 }, entries: [] },
+      {
+        handNo: 1,
+        result: { pot: 2, rake: 0 },
+        entries: [{ address: `0x${'aa'.repeat(20)}`, chips: 1.5 }],
+      },
+    ]) {
+      const w = makeVaultWorld();
+      const c = w.activate();
+      expect(() => c.onHandEnd(snapshot)).not.toThrow();
+      expect(c.phase).toBe('halted');
+      expect(c.canDeal()).toBe(false);
+    }
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const snap = w.snapshot({ pot: 0 });
+    snap.entries.pop(); // a member is missing from the snapshot
+    c.onHandEnd(snap);
+    expect(c.halt).toMatchObject({ cause: 'bad-snapshot', fatal: true });
+  });
+
+  test('chips that appear from nowhere are not signed: not-conserved is fatal and persists across a restart', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice] = w.players;
+    alice.chips += 50;
+    c.onHandEnd(w.snapshot({ pot: 0 }));
+    expect(c.halt).toMatchObject({ cause: 'not-conserved', fatal: true });
+    expect(w.proposals).toHaveLength(0);
+    w.restart();
+    expect(w.coordinator.halt).toMatchObject({ cause: 'not-conserved' });
+  });
+
+  test('a hand ending while a round is open, or after a final, halts instead of proposing', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob, carol] = w.players;
+    carol.client.mode = 'manual';
+    w.playHand({ winner: alice, loser: bob });
+    c.onHandEnd(w.snapshot({ pot: 0 }));
+    expect(c.halt).toMatchObject({ cause: 'hand-while-round-open' });
+  });
+
+  test('a double-sign refusal from the store is fatal, nothing is sent, and the halt survives a restart', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob] = w.players;
+    w.store.reserve = (tableKey, state) => {
+      throw new DoubleSignError({
+        tableKey,
+        nonce: state.nonce,
+        stored: `0x${'11'.repeat(32)}`,
+        attempted: `0x${'22'.repeat(32)}`,
+      });
+    };
+    expect(() => w.playHand({ winner: alice, loser: bob })).not.toThrow();
+    expect(c.halt).toMatchObject({ cause: 'double-sign', fatal: true });
+    expect(w.proposals).toHaveLength(0);
+    delete w.store.reserve;
+    w.restart();
+    expect(w.coordinator.halt).toMatchObject({ cause: 'double-sign' });
+  });
+
+  // A cached row that is wrong until the adapter re-reads it (repair): the proposal is retried once.
+  function staleRow(w, { fixedByReread }) {
+    const real = w.chain.table.bind(w.chain);
+    let stale = true;
+    w.chain.table = (k) => (stale ? { ...real(k), rosterHash: `0x${'00'.repeat(32)}` } : real(k));
+    w.chain.repair = () => {
+      if (fixedByReread) stale = false;
+    };
+  }
+
+  test('a stale chain view gets one re-read and one retry, then the state is proposed', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob] = w.players;
+    staleRow(w, { fixedByReread: true });
+    w.playHand({ winner: alice, loser: bob });
+    expect(c.halt).toMatchObject({ cause: 'stale-chain-cache', fatal: false });
+    expect(w.proposals).toHaveLength(0);
+    w.tick(w.cfg.policy.retryDelayMs);
+    expect(c.halt).toBeNull();
+    expect(w.proposals.map((p) => p.nonce)).toEqual([1n]);
+    expect(lastBundle(w).state.nonce).toBe(1n);
+    noRefusals(w);
+  });
+
+  test('a view still wrong after the re-read: check-failed, fatal, nothing signed', () => {
+    const w = makeVaultWorld();
+    const c = w.activate();
+    const [alice, bob] = w.players;
+    staleRow(w, { fixedByReread: false });
+    w.playHand({ winner: alice, loser: bob });
+    w.tick(w.cfg.policy.retryDelayMs);
+    expect(c.halt).toMatchObject({ cause: 'check-failed', fatal: true });
+    expect(w.proposals).toHaveLength(0);
+  });
+
+  test('resuming a table under another chip unit is refused: pinned-changed, claims locked', () => {
+    const w = makeVaultWorld();
+    w.activate();
+    w.cfg.chipUnit = UNIT * 10n;
+    w.restart();
+    expect(w.coordinator.halt).toMatchObject({ cause: 'pinned-changed' });
+    expect(w.claim(w.players[0])).toMatchObject({ ok: false, code: ERR.VAULT_LOCKED });
+  });
+
+  test('a paused vault: the start fails, is retried with back-off, and succeeds once unpaused', () => {
+    const w = makeVaultWorld();
+    const c = w.boot();
+    w.settle();
+    for (const p of w.players) w.deposit(p, 200);
+    w.chainTick();
+    for (const p of w.players) w.claim(p);
+    w.chain.pause(true);
+    w.startEpoch();
+    expect(c.phase).toBe('filling');
+    expect(c.halt).toBeNull();
+    w.chain.pause(false);
+    w.tick(w.cfg.policy.maxBackoffMs);
+    w.settle();
+    w.tick(w.cfg.policy.startHoldMs);
+    w.settle();
+    expect(c.phase).toBe('active');
   });
 });

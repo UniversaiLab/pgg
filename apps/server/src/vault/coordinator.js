@@ -348,6 +348,7 @@ export class VaultCoordinator {
       this.#maybeProposeBetweenHands();
     });
     this.#guarded('gate', () => {
+      if (this.#gateWatched()) this.#trackGate(this.#clock.now());
       if (this.canDeal()) this.#hostCall('scheduleStart');
     });
     this.#guarded('flush', () => this.#flushOutbox());
@@ -1591,14 +1592,7 @@ export class VaultCoordinator {
           if (phase === 'active') this.#save({ phase: 'stalled' });
         }
       } else if (!this.#inHand()) {
-        // F11: a gate closed for an absent or unclaimed member with no round open is a stall too
-        const view = { ...this.#gateView(), active: true };
-        const reason = dealBlocker(view)?.reason ?? null;
-        if (reason === 'member-offline' || reason === 'member-not-claimed') {
-          this.#gateClosedSince ??= now;
-        } else {
-          this.#gateClosedSince = null;
-        }
+        this.#trackGate(now);
         if (this.#gateClosedSince !== null) {
           stallFrom = this.#gateClosedSince + this.#policy.absentGraceMs;
         }
@@ -1611,6 +1605,28 @@ export class VaultCoordinator {
     if (stallFrom !== null && now >= stallFrom + this.#policy.stallExitMs) {
       this.#requestStallExit(round?.nonce ?? null);
     }
+  }
+
+  // F11: a gate closed for an absent or unclaimed member with no round open is a stall too. Noted after
+  // every change as well as on the tick, so absentGraceMs counts from the moment the gate closed.
+  #trackGate(now) {
+    const reason = dealBlocker({ ...this.#gateView(), active: true })?.reason ?? null;
+    if (reason === 'member-offline' || reason === 'member-not-claimed') {
+      this.#gateClosedSince ??= now;
+    } else {
+      this.#gateClosedSince = null;
+    }
+  }
+
+  #gateWatched() {
+    const phase = this.#rec?.phase;
+    return (
+      Boolean(this.#rec?.base) &&
+      !this.#halt &&
+      (phase === 'active' || phase === 'stalled') &&
+      !this.#round?.isLive &&
+      !this.#inHand()
+    );
   }
 
   // The stall exit: startExit(B) when this epoch has a bundle above the chain, else startExitFromDeposits.
