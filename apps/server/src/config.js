@@ -1,4 +1,5 @@
 import { bytesToHex, randomBytes } from '@noble/hashes/utils.js';
+import { parseVaultConfig } from './vault/vault-config.js';
 
 const positive = (value, fallback) => {
   const n = Number(value);
@@ -41,9 +42,14 @@ function loadTestTables(n) {
   }));
 }
 
+const whole = (value, fallback) => {
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= 0 ? n : fallback;
+};
+
 export function loadConfig(env = process.env) {
   const secret = env.PGG_SECRET ?? bytesToHex(randomBytes(32));
-  return {
+  const config = {
     port: env.PORT === undefined ? 8787 : Number(env.PORT), // 0 picks a free port (tests)
     hostname: env.HOST ?? '0.0.0.0',
     secret,
@@ -67,4 +73,17 @@ export function loadConfig(env = process.env) {
         ? loadTestTables(positive(env.LOAD_TABLES, 0))
         : defaultTables(),
   };
+  // Vault tables are opt-in (docs/signing-layer.md section 9): without VAULT_TABLES nothing below runs and
+  // the config is exactly the play-money one. A bad vault setting throws, so the server never starts half-set.
+  if (env.VAULT_TABLES !== undefined && env.VAULT_TABLES !== '') {
+    const vault = parseVaultConfig(env, { rateCapacity: config.rateLimit.capacity });
+    if (vault.enabled) {
+      config.vault = {
+        ...vault,
+        pollMs: positive(env.VAULT_POLL_MS, 1000), // how often the chain adapter polls the RPC
+        confirmations: whole(env.VAULT_CONFIRMATIONS, 0), // blocks a deposit needs before it can be claimed
+      };
+    }
+  }
+  return config;
 }

@@ -30,10 +30,13 @@ export class Registry {
     return [...this.#actors.values()].map((actor) => actor.summary());
   }
 
-  /** Sum of chips sitting at every table, for conservation checks. */
+  /** Sum of play-money chips sitting at every table, for conservation checks against the wallet. */
   chipsOnTables() {
     let total = 0;
-    for (const actor of this.#actors.values()) total += actor.chipsOnTable();
+    for (const actor of this.#actors.values()) {
+      if (actor.isVault === true) continue; // escrowed on chain, never issued by the play wallet
+      total += actor.chipsOnTable();
+    }
     return total;
   }
 

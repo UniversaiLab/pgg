@@ -268,7 +268,9 @@ describe('claims (section 3)', () => {
       code: ERR.CLAIM_PENDING, // the table is still being created
     });
     w.settle();
-    expect(w.claim(alice)).toMatchObject({ ok: false, code: ERR.BAD_CLAIM }); // no seat yet
+    // no seat yet: between epochs a deposit the chain view has not read is retryable (a real adapter reads
+    // in the background, so a claim sent right after the deposit's receipt would otherwise be refused)
+    expect(w.claim(alice)).toMatchObject({ ok: false, code: ERR.CLAIM_PENDING });
     w.deposit(alice, 200);
     w.deposit(bob, 200, { confirmed: false });
     w.chainTick();

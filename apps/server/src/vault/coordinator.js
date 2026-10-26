@@ -1119,11 +1119,18 @@ export class VaultCoordinator {
     if (bound !== undefined && bound !== who) {
       return fail(ERR.BAD_CLAIM, 'this player already holds another seat at this table');
     }
+    const inEpoch = Boolean(this.#rec.base);
     const seat = this.#chain.seat(this.#k, who);
-    if (!seat || seat.deposit <= 0n) return fail(ERR.BAD_CLAIM, 'no seat on chain');
+    if (!seat || seat.deposit <= 0n) {
+      // Between epochs a deposit can land at any moment, and a real chain view reads it in the background
+      // (this very call queued the read): a client that claims right after its deposit asks again. In an
+      // epoch the roster is fixed, so no seat means no member.
+      return inEpoch
+        ? fail(ERR.BAD_CLAIM, 'no seat on chain')
+        : fail(ERR.CLAIM_PENDING, 'no deposit seen for this address yet');
+    }
     if (seat.confirmed === false)
       return fail(ERR.CLAIM_PENDING, 'the deposit is not confirmed yet');
-    const inEpoch = Boolean(this.#rec.base);
     if (inEpoch && !this.#rec.roster.includes(who)) {
       return fail(ERR.BAD_CLAIM, 'not a member of this epoch');
     }
