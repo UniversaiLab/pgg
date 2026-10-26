@@ -124,17 +124,6 @@ chainDescribe('the vault table end to end on anvil', () => {
   }
 
   async function stopServer() {
-    console.log(
-      'DEBUG alarms',
-      JSON.stringify(coordinator().alarms, (_, v) => (typeof v === 'bigint' ? String(v) : v)),
-    );
-    console.log(
-      'DEBUG chain alarms',
-      JSON.stringify(game.vault.chain.alarms, (_, v) => (typeof v === 'bigint' ? String(v) : v)),
-    );
-    console.log('DEBUG skipped', JSON.stringify(game.vault.chain.skipped));
-    console.log('DEBUG sent', JSON.stringify(game.vault.chain.sent.map((s) => s.kind)));
-    console.log('DEBUG warnings', JSON.stringify(warnings));
     const chain = game.vault.chain;
     game.stop();
     await chain.close();

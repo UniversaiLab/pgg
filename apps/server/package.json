@@ -15,6 +15,7 @@
   "scripts": {
     "start": "bun src/index.js",
     "dev": "bun --hot src/index.js",
-    "bots": "bun scripts/bots.js"
+    "bots": "bun scripts/bots.js",
+    "vault:dev": "bun scripts/vault-dev.js"
   }
 }
