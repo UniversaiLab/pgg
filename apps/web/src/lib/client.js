@@ -2,7 +2,7 @@
 // performs the side effects that follow them. The UI only reads the store and calls these actions.
 
 import { CLIENT, ERR, SERVER } from '@pgg/protocol/constants';
-import { devLogin } from './api.js';
+import { devLogin, siweNonce, siweVerify } from './api.js';
 import {
   addToast,
   applyServerMessage,
@@ -296,6 +296,30 @@ export function createClient({
       write(TOKEN_KEY, token);
       startSocket();
     },
+
+    /** Sign in with the wallet (EIP-4361): the account is the wallet, and only its own seats can be claimed. */
+    async loginWithWallet(name) {
+      const w = await walletReady();
+      await w.connect();
+      const mod = await loadWallet();
+      const nonce = await siweNonce();
+      const message = mod.siweMessage({
+        domain: globalThis.location.host,
+        address: w.address, // any case recovers to the same signer; the server compares lowercase
+        uri: globalThis.location.origin,
+        chainId: vaultConfig.domain.chainId,
+        nonce,
+      });
+      const signature = await w.signMessage(message);
+      const body = await siweVerify({ message, signature, name: name || undefined });
+      token = body.token;
+      write(TOKEN_KEY, token);
+      await refreshWallet().catch(() => null);
+      startSocket();
+    },
+
+    /** Wallet sign-in is offered when this build has a vault and the browser has a wallet. */
+    walletSignInAvailable: () => Boolean(vaultConfig.domain && provider()?.request),
 
     logout() {
       socket?.close();

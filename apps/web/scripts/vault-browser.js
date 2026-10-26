@@ -149,14 +149,15 @@ try {
   await page.goto(base);
   await page.locator('#name').waitFor();
   await page.locator('#name').fill('Alex');
-  await page.getByRole('button', { name: 'Play now' }).click();
+  await page.getByRole('button', { name: 'Sign in with wallet' }).click();
   await page.getByText('Real money').first().waitFor();
   await sleep(800);
   await shot('v01-lobby');
 
   // the deposit sheet: connect, mint test tokens, deposit
   await page.getByRole('button', { name: /Vault/ }).first().click();
-  await page.getByRole('button', { name: 'Connect wallet' }).click();
+  // signed in with the wallet, so it is already connected
+  await page.getByRole('button', { name: /^Get test/ }).waitFor({ timeout: 30_000 });
   await page.getByRole('button', { name: /^Get test/ }).click();
   await page.getByRole('button', { name: /^Deposit / }).waitFor({ timeout: 30_000 });
   await sleep(400);

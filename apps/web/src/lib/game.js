@@ -72,7 +72,11 @@ export function applyServerMessage(state, message) {
       const seated = message.seated;
       return {
         ...state,
-        me: { id: message.player.id, name: message.player.name },
+        me: {
+          id: message.player.id,
+          name: message.player.name,
+          ...(message.player.wallet ? { wallet: message.player.wallet } : {}),
+        },
         balance: message.player.balance,
         tables: message.tables,
         tableId: seated ? seated.tableId : null,

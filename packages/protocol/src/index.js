@@ -181,7 +181,7 @@ export const ServerMessage = z.discriminatedUnion('t', [
   z.object({
     t: z.literal(SERVER.WELCOME),
     v: z.int(),
-    player: z.object({ id: z.string(), name: z.string(), balance: chips }),
+    player: z.object({ id: z.string(), name: z.string(), balance: chips, wallet: addr.optional() }),
     tables: z.array(TableSummary),
     seated: z.object({ tableId, seat }).nullable(),
   }),

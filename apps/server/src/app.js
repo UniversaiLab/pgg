@@ -6,6 +6,7 @@ import { Hono } from 'hono';
 import { serveStatic } from 'hono/bun';
 import { cors } from 'hono/cors';
 import { signToken, verifyToken } from './auth.js';
+import { NonceBook, verifySiwe } from './siwe.js';
 
 const NAME = /^[\p{L}\p{N} ._-]+$/u;
 
@@ -36,6 +37,37 @@ export function createApp({ config, wallet, registry }) {
       ? body.token
       : signToken(config.secret, { id, name, exp: Date.now() + config.tokenTtlMs });
     return c.json({ token, player: { id, name, balance: wallet.balance(id) ?? balance } });
+  });
+
+  // Wallet sign-in (EIP-4361). The player id becomes the wallet address, so the account and the real-money
+  // seat it claims are the same wallet. The message must name the host the request came to (or one listed in
+  // SIWE_DOMAINS), so a signature collected by another site cannot log in here.
+  const nonces = new NonceBook();
+  app.get('/api/siwe/nonce', (c) => c.json({ nonce: nonces.issue() }));
+  app.post('/api/siwe/verify', async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const domains = [new URL(c.req.url).host, ...(config.siweDomains ?? [])];
+    const checked = verifySiwe({
+      message: body.message,
+      signature: body.signature,
+      nonces,
+      domains,
+      chainId: config.vault?.chainId ?? null,
+    });
+    if (!checked.ok) return c.json({ error: checked.error }, 401);
+    const id = checked.address;
+    const name = cleanName(body.name) ?? `${id.slice(0, 6)}…${id.slice(-4)}`.replace('…', '-');
+    const balance = wallet.open(id);
+    const token = signToken(config.secret, {
+      id,
+      name,
+      wallet: id,
+      exp: Date.now() + config.tokenTtlMs,
+    });
+    return c.json({
+      token,
+      player: { id, name, balance: wallet.balance(id) ?? balance, wallet: id },
+    });
   });
 
   // The built web app, when there is one: hashed assets are immutable, the HTML is never cached,

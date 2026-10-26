@@ -1,7 +1,7 @@
 import { m } from 'motion/react';
 import { useState } from 'react';
 import { useClient, useGame } from '../client-context.js';
-import { exact } from '../lib/format.js';
+import { exact, shortAddress } from '../lib/format.js';
 import { Chips } from './AnimatedNumber.jsx';
 import { Avatar } from './Avatar.jsx';
 import { Background } from './Background.jsx';
@@ -27,7 +27,7 @@ export function Lobby() {
           <div className="leading-tight">
             <div className="text-lg font-bold text-white">{me?.name}</div>
             <div className="text-xs font-semibold uppercase tracking-wider text-faint">
-              Play money
+              {me?.wallet ? shortAddress(me.wallet) : 'Play money'}
             </div>
           </div>
         </div>

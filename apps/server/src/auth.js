@@ -49,6 +49,7 @@ export function verifyToken(secret, token, now = Date.now()) {
       typeof payload.id === 'string' &&
       typeof payload.name === 'string' &&
       Number.isFinite(payload.exp) &&
+      (payload.wallet === undefined || /^0x[0-9a-f]{40}$/.test(payload.wallet)) &&
       payload.exp > now;
     return valid ? payload : null;
   } catch {

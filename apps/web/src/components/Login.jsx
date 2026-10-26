@@ -11,6 +11,18 @@ export function Login() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
+  async function walletSignIn() {
+    if (busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      await client.loginWithWallet(name.trim());
+    } catch (cause) {
+      setError(cause.message);
+      setBusy(false);
+    }
+  }
+
   async function submit(event) {
     event.preventDefault();
     if (busy) return;
@@ -80,11 +92,23 @@ export function Login() {
           </Button>
         </m.form>
 
+        {client.walletSignInAvailable?.() && (
+          <m.div
+            variants={{ hidden: { opacity: 0, y: 24 }, show: { opacity: 1, y: 0 } }}
+            className="mt-3 w-full"
+          >
+            <Button tone="white" className="w-full" disabled={busy} onClick={walletSignIn}>
+              Sign in with wallet
+            </Button>
+          </m.div>
+        )}
+
         <m.p
           variants={{ hidden: { opacity: 0 }, show: { opacity: 1 } }}
           className="mt-6 max-w-xs text-center text-sm text-faint"
         >
-          Play-money only for now. Every hand ends with a proof you can verify yourself.
+          Play money with a name, real money with your wallet. Every hand ends with a proof you can
+          verify yourself.
         </m.p>
       </m.div>
     </div>

@@ -142,6 +142,14 @@ export function createWallet({
 
     token,
 
+    /** personal_sign of a text message with the connected account. */
+    async signMessage(text) {
+      if (!address) throw new WalletError('no-wallet', 'Connect your wallet first');
+      const bytes = new TextEncoder().encode(text);
+      const hexText = `0x${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+      return request('personal_sign', [hexText, address]);
+    },
+
     /** { token, balance, allowance, withdrawable } in token base units (bigint). */
     async balances() {
       const t = await token();
@@ -199,3 +207,20 @@ export const formatUnits = (amount, decimals) => {
   const frac = (amount % base).toString().padStart(decimals, '0').replace(/0+$/, '');
   return frac ? `${whole}.${frac.slice(0, 2)}` : String(whole);
 };
+
+/** The EIP-4361 sign-in message (the server checks the same layout). */
+export function siweMessage({ domain, address, uri, chainId, nonce, now = new Date() }) {
+  return [
+    `${domain} wants you to sign in with your Ethereum account:`,
+    address,
+    '',
+    'Sign in to PGG. This signature only proves you own this wallet; it cannot move funds.',
+    '',
+    `URI: ${uri}`,
+    'Version: 1',
+    `Chain ID: ${chainId}`,
+    `Nonce: ${nonce}`,
+    `Issued At: ${now.toISOString()}`,
+    `Expiration Time: ${new Date(now.getTime() + 10 * 60_000).toISOString()}`,
+  ].join('\n');
+}

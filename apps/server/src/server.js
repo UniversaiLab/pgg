@@ -77,7 +77,11 @@ export function createGame(config = loadConfig(), { clock = realClock, vault = n
       wallet.open(claims.id);
       const upgraded = bunServer.upgrade(request, {
         data: {
-          player: { id: claims.id, name: claims.name },
+          player: {
+            id: claims.id,
+            name: claims.name,
+            ...(claims.wallet ? { wallet: claims.wallet } : {}),
+          },
           bucket: new TokenBucket(config.rateLimit),
           strikes: 0,
         },

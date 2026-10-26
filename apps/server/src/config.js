@@ -68,6 +68,8 @@ export function loadConfig(env = process.env) {
     watchdogMs: Number(env.WATCHDOG_MS ?? 10_000),
     corsOrigins: (env.CORS_ORIGINS ?? 'http://localhost:5173,http://127.0.0.1:5173').split(','),
     webDist: env.WEB_DIST ?? null,
+    // extra hosts a sign-in message may name (behind a proxy the request's own host may differ)
+    siweDomains: (env.SIWE_DOMAINS ?? '').split(',').filter(Boolean),
     tables:
       positive(env.LOAD_TABLES, 0) > 0
         ? loadTestTables(positive(env.LOAD_TABLES, 0))

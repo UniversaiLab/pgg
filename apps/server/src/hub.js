@@ -175,6 +175,13 @@ export class Hub {
         return refuse({ ok: false, code: ERR.ALREADY_SEATED }, 'claim');
       }
       const { tableId, address, sig } = message;
+      // Signed in with a wallet: that wallet is the only seat this account may claim.
+      if (player.wallet && String(address).toLowerCase() !== player.wallet) {
+        return refuse(
+          { ok: false, code: ERR.BAD_CLAIM, msg: 'that seat belongs to another wallet' },
+          'claim',
+        );
+      }
       return void refuse(target.claim(player, { tableId, address, sig }), 'claim');
     }
 

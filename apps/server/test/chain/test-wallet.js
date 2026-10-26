@@ -48,6 +48,8 @@ export function testWalletHandler({ node, privateKey, reject = new Set() }) {
         case 'wallet_switchEthereumChain':
         case 'wallet_addEthereumChain':
           return { result: null };
+        case 'personal_sign':
+          return { result: await account.signMessage({ message: { raw: params[0] } }) };
         case 'eth_sendTransaction': {
           const tx = params[0];
           const hash = await wallet.sendTransaction({
