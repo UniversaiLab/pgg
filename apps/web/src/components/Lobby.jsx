@@ -1,7 +1,7 @@
 import { m } from 'motion/react';
 import { useState } from 'react';
 import { useClient, useGame } from '../client-context.js';
-import { exact, shortAddress } from '../lib/format.js';
+import { exact, shortAddress, tokenAmount } from '../lib/format.js';
 import { Chips } from './AnimatedNumber.jsx';
 import { Avatar } from './Avatar.jsx';
 import { Background } from './Background.jsx';
@@ -14,7 +14,8 @@ const seatDots = (table) =>
 
 export function Lobby() {
   const client = useClient();
-  const { me, balance, tables, connection } = useGame();
+  const { me, balance, tables, connection, wallet } = useGame();
+  const owed = wallet ? BigInt(wallet.withdrawable ?? 0) : 0n;
   const [picked, setPicked] = useState(null);
   const [vaultPick, setVaultPick] = useState(null);
 
@@ -44,6 +45,21 @@ export function Lobby() {
         >
           <WifiOff className="h-5 w-5 text-red-soft" />
           Reconnecting…
+        </div>
+      )}
+
+      {owed > 0n && (
+        <div className="relative z-10 mt-4 flex items-center justify-between gap-3 rounded-2xl bg-white px-4 py-3 text-black">
+          <span className="text-sm font-semibold">
+            {tokenAmount(owed, wallet.decimals)} {wallet.symbol} is waiting for you in the vault
+          </span>
+          <button
+            type="button"
+            onClick={() => client.withdraw()}
+            className="shrink-0 rounded-full bg-black px-4 py-2 text-sm font-bold text-white active:scale-95"
+          >
+            Withdraw
+          </button>
         </div>
       )}
 

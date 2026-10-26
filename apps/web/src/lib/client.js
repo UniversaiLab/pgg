@@ -190,6 +190,8 @@ export function createClient({
       );
     }
     if (message.t === SERVER.ERROR && message.code === 'rate-limited') buzz(30);
+    // a vault seat was paid out on chain: show the new wallet balance (and anything parked to withdraw)
+    if (message.t === SERVER.UNSEATED && wallet?.address) refreshWallet().catch(() => null);
   }
 
   // The server commits to the next hand while the current one is being played; answering with a
