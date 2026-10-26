@@ -6,6 +6,7 @@ import { Chips } from './AnimatedNumber.jsx';
 import { Avatar } from './Avatar.jsx';
 import { Background } from './Background.jsx';
 import { BuyInSheet } from './BuyInSheet.jsx';
+import { DepositSheet } from './DepositSheet.jsx';
 import { ChevronRight, ChipIcon, WifiOff } from './Icons.jsx';
 
 const seatDots = (table) =>
@@ -15,6 +16,7 @@ export function Lobby() {
   const client = useClient();
   const { me, balance, tables, connection } = useGame();
   const [picked, setPicked] = useState(null);
+  const [vaultPick, setVaultPick] = useState(null);
 
   return (
     <div className="safe-top safe-bottom relative flex min-h-full flex-col overflow-hidden px-5">
@@ -66,7 +68,7 @@ export function Lobby() {
             >
               <button
                 type="button"
-                onClick={() => setPicked(table)}
+                onClick={() => (table.vault ? setVaultPick(table) : setPicked(table))}
                 className="group flex w-full items-center gap-4 rounded-[22px] border border-line bg-surface/90 p-4 text-left backdrop-blur transition-transform active:scale-[0.98]"
               >
                 <div className="flex h-16 min-w-[4.25rem] shrink-0 flex-col items-center justify-center rounded-2xl bg-red px-2 text-white shadow-[0_0_28px_rgba(240,40,73,0.35)]">
@@ -78,7 +80,14 @@ export function Lobby() {
                   </span>
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-lg font-bold text-white">{table.name}</div>
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-lg font-bold text-white">{table.name}</span>
+                    {table.vault && (
+                      <span className="shrink-0 rounded-full bg-white px-2 py-0.5 text-[11px] font-black uppercase tracking-wider text-black">
+                        Real money
+                      </span>
+                    )}
+                  </div>
                   <div className="mt-0.5 text-sm text-muted">
                     Buy-in {exact(table.minBuyIn)}–{exact(table.maxBuyIn)}
                   </div>
@@ -112,6 +121,8 @@ export function Lobby() {
           Log out
         </button>
       </footer>
+
+      <DepositSheet table={vaultPick} onClose={() => setVaultPick(null)} />
 
       <BuyInSheet
         open={picked !== null}

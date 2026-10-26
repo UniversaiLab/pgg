@@ -436,6 +436,54 @@ export function createVaultController({
       return noted;
     },
 
+    /**
+     * Before a deposit: make (or reuse) this table's session key for `wallet` and write it to storage, so the key
+     * exists before the chain names it. -> { ok: true, tableKey, sessionKey (its address), unit } | { ok: false, kind, detail }
+     */
+    prepareDeposit(tableId, { wallet }) {
+      const entry = tables.get(tableId);
+      if (!entry?.summary) return { ok: false, kind: 'unknown-table', detail: 'not a vault table' };
+      const unit = BigInt(entry.summary.chipUnit);
+      const made = signer.ensureSessionKey(entry.tableKey, {
+        wallet,
+        domain: domain ?? {
+          chainId: entry.summary.chainId,
+          verifyingContract: entry.summary.vault.toLowerCase(),
+        },
+        unit,
+      });
+      if (!made.ok) return made;
+      changed(entry);
+      return { ok: true, tableKey: entry.tableKey, sessionKey: made.address, unit };
+    },
+
+    /**
+     * What a self-exit needs from this device: the newest all-signed bundle it holds (wire form) and the roster
+     * of the epoch it belongs to. Null when this device holds no record for the table.
+     */
+    exitInfo(tableId) {
+      const entry = tables.get(tableId);
+      const rec = entry ? record(entry.tableKey) : null;
+      if (!rec) return null;
+      return {
+        tableKey: entry.tableKey,
+        wallet: rec.wallet,
+        bundle: rec.bundle ?? null,
+        roster: rec.roster ?? rec.pinned?.roster ?? null,
+        epochClosed: rec.epochClosed === true,
+      };
+    },
+
+    /** The vault tables this device holds a key for: [{ tableId, tableKey, wallet }]. */
+    heldTables() {
+      const out = [];
+      for (const entry of tables.values()) {
+        const rec = record(entry.tableKey);
+        if (rec) out.push({ tableId: entry.tableId, tableKey: entry.tableKey, wallet: rec.wallet });
+      }
+      return out;
+    },
+
     /** What the UI shows for this table, or null when it is not a vault table this controller knows. */
     state(tableId) {
       const entry = tables.get(tableId);

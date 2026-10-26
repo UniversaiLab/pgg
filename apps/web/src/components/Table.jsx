@@ -97,10 +97,29 @@ function Payout({ pos, box, pot }) {
   );
 }
 
+const EXIT_STEPS = {
+  exiting: 'confirm in wallet…',
+  'exit-pending': 'exit started',
+  exited: 'sent',
+  error: 'failed',
+};
+const exitStatus = (cashier) => (cashier ? (EXIT_STEPS[cashier.step] ?? null) : null);
+
 export function Table() {
   const client = useClient();
   const game = useGame();
-  const { table, seat: heroSeat, hole, result, proofs, balance, tables, seq } = game;
+  const {
+    table,
+    seat: heroSeat,
+    hole,
+    result,
+    proofs,
+    balance,
+    tables,
+    seq,
+    cashier,
+    tableId,
+  } = game;
   const feltRef = useRef(null);
   const box = useBox(feltRef);
   const [sheet, setSheet] = useState(null); // 'menu' | 'fairness' | 'leave' | 'chips'
@@ -317,6 +336,15 @@ export function Table() {
           setHaptics(!vibration);
         }}
         vaultTable={isVault}
+        exitStatus={exitStatus(cashier)}
+        onExit={async () => {
+          setSheet(null);
+          const done = await client.exitVault(tableId);
+          if (done.ok && done.pending)
+            client.toast('Exit started. You are paid when the window ends.');
+          else if (done.ok) client.toast('Exit sent from your wallet');
+          else client.toast(done.error, 'error');
+        }}
         canAddChips={
           !isVault &&
           Boolean(summary) &&

@@ -120,6 +120,7 @@ export const TableSummary = z.object({
       maxRakeBps: z.int().min(0).max(MAX_RAKE_BPS_CEILING),
       exitWindowSec: z.int().min(MIN_EXIT_WINDOW_SEC).max(MAX_EXIT_WINDOW_SEC),
       arbiter: addr,
+      phase: z.enum(VAULT_PHASES).optional(),
     })
     .optional(),
 });

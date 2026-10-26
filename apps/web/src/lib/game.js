@@ -25,6 +25,10 @@ export const initialState = Object.freeze({
   // Vault tables only: what this device's signer reports for the table it is at (lib/vault.js uiState plus
   // the table id). Kept through an unseat: a failure stays on screen until the chain says the table is done.
   vault: null,
+  // The player's own wallet once connected: { address, symbol, decimals, balance, withdrawable } (strings for
+  // amounts in token base units), and the cashier flow in progress: { tableId, step, error }.
+  wallet: null,
+  cashier: null,
 });
 
 export const addToast = (state, text, tone = 'info') => ({

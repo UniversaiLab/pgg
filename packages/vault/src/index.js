@@ -14,6 +14,7 @@ export {
   verifyBundle,
 } from './bundle.js';
 export { UINT64_MAX, UINT256_MAX } from './bytes.js';
+export { addressAt, calls, encodeCall, selector, stringAt, wordAt } from './calldata.js';
 export {
   chainShowsSettled,
   createRpcChainView,

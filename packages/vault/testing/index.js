@@ -130,9 +130,9 @@ export const testAccount = (name) =>
  * Start a local anvil. Returns viem clients and helpers; call stop() when done.
  * Accounts are made up from names and funded with setBalance, so no well-known dev keys are used.
  */
-export async function startAnvil({ chainId = 31337 } = {}) {
+export async function startAnvil({ chainId = 31337, port: fixedPort = null } = {}) {
   if (!support.ok) throw new Error(`chain tests unavailable: ${support.reason}`);
-  const port = await freePort();
+  const port = fixedPort ?? (await freePort());
   const rpcUrl = `http://127.0.0.1:${port}`;
   const child = Bun.spawn(
     [support.anvil, '--port', String(port), '--chain-id', String(chainId), '--quiet'],

@@ -40,3 +40,17 @@ export function hash01(text) {
   for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 16777619);
   return (h >>> 0) / 4294967296;
 }
+
+/** Token base units (bigint or decimal string) as a short amount: 5_000_000n with 6 decimals -> "5.00". */
+export function tokenAmount(units, decimals = 6) {
+  const value = BigInt(units ?? 0);
+  const base = 10n ** BigInt(decimals);
+  const cents = (value * 100n) / base; // two places, rounded down: never show more than there is
+  const whole = cents / 100n;
+  const frac = (cents % 100n).toString().padStart(2, '0');
+  return `${whole.toLocaleString('en-US')}.${frac}`;
+}
+
+/** A wallet address as 0x12ab…cdef. */
+export const shortAddress = (address) =>
+  address ? `${address.slice(0, 6)}…${address.slice(-4)}` : '';

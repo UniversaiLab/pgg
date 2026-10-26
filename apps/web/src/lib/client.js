@@ -55,6 +55,8 @@ export function createClient({
   seed = randomSeed,
   verify = verifyLazily,
   loadVault = () => import('./vault.js'),
+  loadWallet = () => import('./wallet.js'),
+  provider = () => globalThis.ethereum,
   vaultConfig = buildVaultConfig(),
   vaultOptions = {}, // extra createVaultController options (tests: chainView, locks, ...)
   timers = globalThis,
@@ -218,6 +220,53 @@ export function createClient({
 
   const send = (message) => socket?.send(message) ?? false;
 
+  // ---- the cashier: the player's own wallet -------------------------------------------------------------
+  // Lazy like the vault controller. Money only moves in transactions the player confirms in their wallet.
+
+  let wallet = null;
+  const setCashier = (patch) =>
+    store.set((state) => ({
+      ...state,
+      cashier: patch === null ? null : { ...state.cashier, ...patch },
+    }));
+  const setWallet = (patch) =>
+    store.set((state) => ({ ...state, wallet: { ...(state.wallet ?? {}), ...patch } }));
+
+  async function walletReady() {
+    if (wallet) return wallet;
+    if (!vaultConfig.domain)
+      throw Object.assign(new Error('This app build has no vault configured'), {
+        code: 'no-vault',
+      });
+    const mod = await loadWallet();
+    wallet = mod.createWallet({
+      provider: provider(),
+      chainId: vaultConfig.domain.chainId,
+      rpcUrl: vaultConfig.rpcUrl,
+      vault: vaultConfig.domain.verifyingContract,
+    });
+    return wallet;
+  }
+
+  async function refreshWallet() {
+    if (!wallet?.address) return null;
+    const b = await wallet.balances();
+    setWallet({
+      address: wallet.address,
+      symbol: b.token.symbol,
+      decimals: b.token.decimals,
+      balance: b.balance.toString(),
+      withdrawable: b.withdrawable.toString(),
+    });
+    return b;
+  }
+
+  const fail = (error) => {
+    const text = error?.message ?? String(error);
+    setCashier({ step: 'error', error: text });
+    return { ok: false, error: text, code: error?.code ?? 'error' };
+  };
+
   return {
     store,
     get socket() {
@@ -260,6 +309,7 @@ export function createClient({
       vaultContext = null;
       if (claimRetry !== null) timers.clearTimeout(claimRetry);
       claimRetry = null;
+      wallet = null;
       store.set({ ...initialState, phase: 'login' });
     },
 
@@ -270,6 +320,136 @@ export function createClient({
     },
 
     join: (tableId, buyIn) => send({ t: CLIENT.JOIN, tableId, buyIn }),
+
+    /** Is there a wallet in this browser at all (window.ethereum)? */
+    walletAvailable: () => Boolean(provider()?.request),
+
+    /** Connect the player's wallet on the table's chain and read the token balances. */
+    async connectWallet() {
+      try {
+        setCashier({ step: 'connecting', error: null });
+        const w = await walletReady();
+        await w.connect();
+        await refreshWallet();
+        setCashier({ step: 'idle' });
+        return { ok: true, address: w.address };
+      } catch (error) {
+        return fail(error);
+      }
+    },
+
+    refreshWallet: () => refreshWallet().catch(() => null),
+
+    /**
+     * Put `chips` on a vault table from the wallet: make the table's session key (stored before anything
+     * names it on chain), approve if needed, deposit, then claim the seat. Steps show in state.cashier.
+     */
+    async deposit(tableId, chips) {
+      try {
+        const w = await walletReady();
+        if (!w.address) await w.connect();
+        const v = await ensureVault();
+        if (!v) throw new Error('Could not load the table signer');
+        const prepared = v.prepareDeposit(tableId, { wallet: w.address });
+        if (!prepared.ok) throw new Error(prepared.detail ?? 'Could not make a key for this table');
+        const amount = BigInt(chips) * prepared.unit;
+        setCashier({ tableId, step: 'approve', error: null });
+        await w.deposit({
+          tableKey: prepared.tableKey,
+          amount,
+          sessionKey: prepared.sessionKey,
+          onStep: (step) => setCashier({ step }),
+        });
+        setCashier({ step: 'claiming' });
+        vaultContext = { ...(vaultContext ?? {}), claim: true };
+        v.claimAll();
+        await refreshWallet();
+        setCashier({ step: 'done' });
+        return { ok: true };
+      } catch (error) {
+        return fail(error);
+      }
+    },
+
+    /** Test chains only: mint MockToken to the connected wallet. */
+    async mintTestTokens(amount) {
+      try {
+        const w = await walletReady();
+        if (!w.address) await w.connect();
+        setCashier({ step: 'minting', error: null });
+        await w.mintTestTokens(BigInt(amount));
+        await refreshWallet();
+        setCashier({ step: 'idle' });
+        return { ok: true };
+      } catch (error) {
+        return fail(error);
+      }
+    },
+
+    /**
+     * Leave a vault table and get the money back, without the server if need be:
+     *   Filling   leave(): the deposit comes straight back
+     *   Active    startExit from the newest all-signed state this device holds (or from the deposits when
+     *             none was signed this epoch); after the exit window anyone, the server included, pays it out
+     *   Exiting   finalizeExit once the window has passed (the server normally does this itself)
+     */
+    async exitVault(tableId) {
+      try {
+        const w = await walletReady();
+        if (!w.address) await w.connect();
+        const v = await ensureVault();
+        const info = v?.exitInfo(tableId);
+        if (!info) throw new Error('This device holds no seat at that table');
+        const mod = await loadVault();
+        const view = mod.pinnedChainView({
+          rpcUrl: vaultConfig.rpcUrl,
+          vault: vaultConfig.domain.verifyingContract,
+        });
+        const read = view ? await view.table(info.tableKey) : { ok: false };
+        const row = read.ok ? read.table : null;
+        const status = row ? Number(row.status) : null;
+        setCashier({ tableId, step: 'exiting', error: null });
+        if (status === 1) {
+          await w.leave(info.tableKey);
+        } else if (status === 2) {
+          if (info.bundle) await w.startExit(info.bundle);
+          else if (info.roster) await w.startExitFromDeposits(info.tableKey, info.roster);
+          else throw new Error('No signed state on this device to exit from');
+        } else if (status === 3) {
+          const now = Math.floor(Date.now() / 1000);
+          if (now <= Number(row.exitDeadline)) {
+            setCashier({ step: 'exit-pending', deadline: Number(row.exitDeadline) });
+            return { ok: true, pending: true, deadline: Number(row.exitDeadline) };
+          }
+          if (!info.bundle) throw new Error('The server will pay this exit out');
+          await w.finalizeExit(info.bundle.state);
+        } else {
+          throw new Error('The table has already paid out');
+        }
+        await refreshWallet();
+        setCashier({ step: 'exited' });
+        return { ok: true };
+      } catch (error) {
+        return fail(error);
+      }
+    },
+
+    /** Pull a payout the token could not push (it sits in the vault for this wallet). */
+    async withdraw() {
+      try {
+        const w = await walletReady();
+        if (!w.address) await w.connect();
+        setCashier({ step: 'withdrawing', error: null });
+        await w.withdraw();
+        await refreshWallet();
+        setCashier({ step: 'idle' });
+        return { ok: true };
+      } catch (error) {
+        return fail(error);
+      }
+    },
+
+    closeCashier: () => setCashier(null),
     leave() {
       // at a vault table the leave intent is recorded first: from now on a final that keeps me is refused
       const { tableId } = store.get();

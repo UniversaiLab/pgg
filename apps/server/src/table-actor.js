@@ -603,6 +603,8 @@ export class TableActor {
       maxRakeBps: Number(info.maxRakeBps),
       exitWindowSec: Number(info.exitWindowSec),
       arbiter: info.arbiter,
+      // the lobby shows whether deposits are open (the contract takes them only while the table is filling)
+      phase: this.#vault.phase,
     };
   }
 
